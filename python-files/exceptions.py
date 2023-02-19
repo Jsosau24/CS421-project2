@@ -1,60 +1,165 @@
-from django.db import DatabaseError
+"""
+The :mod:`sklearn.exceptions` module includes all custom warnings and error
+classes used across scikit-learn.
+"""
+
+__all__ = [
+    "NotFittedError",
+    "ConvergenceWarning",
+    "DataConversionWarning",
+    "DataDimensionalityWarning",
+    "EfficiencyWarning",
+    "FitFailedWarning",
+    "SkipTestWarning",
+    "UndefinedMetricWarning",
+    "PositiveSpectrumWarning",
+]
 
 
-class AmbiguityError(Exception):
-    """More than one migration matches a name prefix."""
+class NotFittedError(ValueError, AttributeError):
+    """Exception class to raise if estimator is used before fitting.
 
-    pass
+    This class inherits from both ValueError and AttributeError to help with
+    exception handling and backward compatibility.
 
+    Examples
+    --------
+    >>> from sklearn.svm import LinearSVC
+    >>> from sklearn.exceptions import NotFittedError
+    >>> try:
+    ...     LinearSVC().predict([[1, 2], [2, 3], [3, 4]])
+    ... except NotFittedError as e:
+    ...     print(repr(e))
+    NotFittedError("This LinearSVC instance is not fitted yet. Call 'fit' with
+    appropriate arguments before using this estimator."...)
 
-class BadMigrationError(Exception):
-    """There's a bad migration (unreadable/bad format/etc.)."""
-
-    pass
-
-
-class CircularDependencyError(Exception):
-    """There's an impossible-to-resolve circular dependency."""
-
-    pass
-
-
-class InconsistentMigrationHistory(Exception):
-    """An applied migration has some of its dependencies not applied."""
-
-    pass
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.validation.
+    """
 
 
-class InvalidBasesError(ValueError):
-    """A model's base classes can't be resolved."""
+class ConvergenceWarning(UserWarning):
+    """Custom warning to capture convergence problems
 
-    pass
-
-
-class IrreversibleError(RuntimeError):
-    """An irreversible migration is about to be reversed."""
-
-    pass
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.
+    """
 
 
-class NodeNotFoundError(LookupError):
-    """An attempt on a node is made that is not available in the graph."""
+class DataConversionWarning(UserWarning):
+    """Warning used to notify implicit data conversions happening in the code.
 
-    def __init__(self, message, node, origin=None):
-        self.message = message
-        self.origin = origin
-        self.node = node
+    This warning occurs when some input data needs to be converted or
+    interpreted in a way that may not match the user's expectations.
+
+    For example, this warning may occur when the user
+        - passes an integer array to a function which expects float input and
+          will convert the input
+        - requests a non-copying operation, but a copy is required to meet the
+          implementation's data-type expectations;
+        - passes an input whose shape can be interpreted ambiguously.
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.validation.
+    """
+
+
+class DataDimensionalityWarning(UserWarning):
+    """Custom warning to notify potential issues with data dimensionality.
+
+    For example, in random projection, this warning is raised when the
+    number of components, which quantifies the dimensionality of the target
+    projection space, is higher than the number of features, which quantifies
+    the dimensionality of the original source space, to imply that the
+    dimensionality of the problem will not be reduced.
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.
+    """
+
+
+class EfficiencyWarning(UserWarning):
+    """Warning used to notify the user of inefficient computation.
+
+    This warning notifies the user that the efficiency may not be optimal due
+    to some reason which may be included as a part of the warning message.
+    This may be subclassed into a more specific Warning class.
+
+    .. versionadded:: 0.18
+    """
+
+
+class FitFailedWarning(RuntimeWarning):
+    """Warning class used if there is an error while fitting the estimator.
+
+    This Warning is used in meta estimators GridSearchCV and RandomizedSearchCV
+    and the cross-validation helper function cross_val_score to warn when there
+    is an error while fitting the estimator.
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.cross_validation.
+    """
+
+
+class SkipTestWarning(UserWarning):
+    """Warning class used to notify the user of a test that was skipped.
+
+    For example, one of the estimator checks requires a pandas import.
+    If the pandas package cannot be imported, the test will be skipped rather
+    than register as a failure.
+    """
+
+
+class UndefinedMetricWarning(UserWarning):
+    """Warning used when the metric is invalid
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.base.
+    """
+
+
+class PositiveSpectrumWarning(UserWarning):
+    """Warning raised when the eigenvalues of a PSD matrix have issues
+
+    This warning is typically raised by ``_check_psd_eigenvalues`` when the
+    eigenvalues of a positive semidefinite (PSD) matrix such as a gram matrix
+    (kernel) present significant negative eigenvalues, or bad conditioning i.e.
+    very small non-zero eigenvalues compared to the largest eigenvalue.
+
+    .. versionadded:: 0.22
+    """
+
+
+class InconsistentVersionWarning(UserWarning):
+    """Warning raised when an estimator is unpickled with a inconsistent version.
+
+    Parameters
+    ----------
+    estimator_name : str
+        Estimator name.
+
+    current_sklearn_version : str
+        Current scikit-learn version.
+
+    original_sklearn_version : str
+        Original scikit-learn version.
+    """
+
+    def __init__(
+        self, *, estimator_name, current_sklearn_version, original_sklearn_version
+    ):
+        self.estimator_name = estimator_name
+        self.current_sklearn_version = current_sklearn_version
+        self.original_sklearn_version = original_sklearn_version
 
     def __str__(self):
-        return self.message
-
-    def __repr__(self):
-        return "NodeNotFoundError(%r)" % (self.node,)
-
-
-class MigrationSchemaMissing(DatabaseError):
-    pass
-
-
-class InvalidMigrationPlan(ValueError):
-    pass
+        return (
+            f"Trying to unpickle estimator {self.estimator_name} from version"
+            f" {self.original_sklearn_version} when "
+            f"using version {self.current_sklearn_version}. This might lead to breaking"
+            " code or "
+            "invalid results. Use at your own risk. "
+            "For more info please refer to:\n"
+            "https://scikit-learn.org/stable/model_persistence.html"
+            "#security-maintainability-limitations"
+        )

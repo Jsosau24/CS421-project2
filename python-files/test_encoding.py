@@ -1,220 +1,310 @@
-import datetime
-import sys
-import unittest
-from pathlib import Path
-from unittest import mock
-from urllib.parse import quote_plus
-
-from django.test import SimpleTestCase
-from django.utils.encoding import (
-    DjangoUnicodeDecodeError,
-    escape_uri_path,
-    filepath_to_uri,
-    force_bytes,
-    force_str,
-    get_system_encoding,
-    iri_to_uri,
-    repercent_broken_unicode,
-    smart_bytes,
-    smart_str,
-    uri_to_iri,
+"""
+Tests encoding functionality during parsing
+for all of the parsers defined in parsers.py
+"""
+from io import (
+    BytesIO,
+    TextIOWrapper,
 )
-from django.utils.functional import SimpleLazyObject
-from django.utils.translation import gettext_lazy
+import os
+import tempfile
+import uuid
+
+import numpy as np
+import pytest
+
+from pandas import (
+    DataFrame,
+    read_csv,
+)
+import pandas._testing as tm
+
+skip_pyarrow = pytest.mark.usefixtures("pyarrow_skip")
 
 
-class TestEncodingUtils(SimpleTestCase):
-    def test_force_str_exception(self):
-        """
-        Broken __str__ actually raises an error.
-        """
+@skip_pyarrow
+def test_bytes_io_input(all_parsers):
+    encoding = "cp1255"
+    parser = all_parsers
 
-        class MyString:
-            def __str__(self):
-                return b"\xc3\xb6\xc3\xa4\xc3\xbc"
+    data = BytesIO("שלום:1234\n562:123".encode(encoding))
+    result = parser.read_csv(data, sep=":", encoding=encoding)
 
-        # str(s) raises a TypeError if the result is not a text type.
-        with self.assertRaises(TypeError):
-            force_str(MyString())
+    expected = DataFrame([[562, 123]], columns=["שלום", "1234"])
+    tm.assert_frame_equal(result, expected)
 
-    def test_force_str_lazy(self):
-        s = SimpleLazyObject(lambda: "x")
-        self.assertIs(type(force_str(s)), str)
 
-    def test_force_str_DjangoUnicodeDecodeError(self):
-        msg = (
-            "'utf-8' codec can't decode byte 0xff in position 0: invalid "
-            "start byte. You passed in b'\\xff' (<class 'bytes'>)"
-        )
-        with self.assertRaisesMessage(DjangoUnicodeDecodeError, msg):
-            force_str(b"\xff")
+@skip_pyarrow
+def test_read_csv_unicode(all_parsers):
+    parser = all_parsers
+    data = BytesIO("\u0141aski, Jan;1".encode())
 
-    def test_force_bytes_exception(self):
-        """
-        force_bytes knows how to convert to bytes an exception
-        containing non-ASCII characters in its args.
-        """
-        error_msg = "This is an exception, voilà"
-        exc = ValueError(error_msg)
-        self.assertEqual(force_bytes(exc), error_msg.encode())
-        self.assertEqual(
-            force_bytes(exc, encoding="ascii", errors="ignore"),
-            b"This is an exception, voil",
-        )
+    result = parser.read_csv(data, sep=";", encoding="utf-8", header=None)
+    expected = DataFrame([["\u0141aski, Jan", 1]])
+    tm.assert_frame_equal(result, expected)
 
-    def test_force_bytes_strings_only(self):
-        today = datetime.date.today()
-        self.assertEqual(force_bytes(today, strings_only=True), today)
 
-    def test_force_bytes_encoding(self):
-        error_msg = "This is an exception, voilà".encode()
-        result = force_bytes(error_msg, encoding="ascii", errors="ignore")
-        self.assertEqual(result, b"This is an exception, voil")
+@skip_pyarrow
+@pytest.mark.parametrize("sep", [",", "\t"])
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16le", "utf-16be"])
+def test_utf16_bom_skiprows(all_parsers, sep, encoding):
+    # see gh-2298
+    parser = all_parsers
+    data = """skip this
+skip this too
+A,B,C
+1,2,3
+4,5,6""".replace(
+        ",", sep
+    )
+    path = f"__{uuid.uuid4()}__.csv"
+    kwargs = {"sep": sep, "skiprows": 2}
+    utf8 = "utf-8"
 
-    def test_force_bytes_memory_view(self):
-        data = b"abc"
-        result = force_bytes(memoryview(data))
-        # Type check is needed because memoryview(bytes) == bytes.
-        self.assertIs(type(result), bytes)
-        self.assertEqual(result, data)
+    with tm.ensure_clean(path) as path:
+        bytes_data = data.encode(encoding)
 
-    def test_smart_bytes(self):
-        class Test:
-            def __str__(self):
-                return "ŠĐĆŽćžšđ"
+        with open(path, "wb") as f:
+            f.write(bytes_data)
 
-        lazy_func = gettext_lazy("x")
-        self.assertIs(smart_bytes(lazy_func), lazy_func)
-        self.assertEqual(
-            smart_bytes(Test()),
-            b"\xc5\xa0\xc4\x90\xc4\x86\xc5\xbd\xc4\x87\xc5\xbe\xc5\xa1\xc4\x91",
-        )
-        self.assertEqual(smart_bytes(1), b"1")
-        self.assertEqual(smart_bytes("foo"), b"foo")
+        with TextIOWrapper(BytesIO(data.encode(utf8)), encoding=utf8) as bytes_buffer:
+            result = parser.read_csv(path, encoding=encoding, **kwargs)
+            expected = parser.read_csv(bytes_buffer, encoding=utf8, **kwargs)
+        tm.assert_frame_equal(result, expected)
 
-    def test_smart_str(self):
-        class Test:
-            def __str__(self):
-                return "ŠĐĆŽćžšđ"
 
-        lazy_func = gettext_lazy("x")
-        self.assertIs(smart_str(lazy_func), lazy_func)
-        self.assertEqual(
-            smart_str(Test()), "\u0160\u0110\u0106\u017d\u0107\u017e\u0161\u0111"
-        )
-        self.assertEqual(smart_str(1), "1")
-        self.assertEqual(smart_str("foo"), "foo")
+@skip_pyarrow
+def test_utf16_example(all_parsers, csv_dir_path):
+    path = os.path.join(csv_dir_path, "utf16_ex.txt")
+    parser = all_parsers
+    result = parser.read_csv(path, encoding="utf-16", sep="\t")
+    assert len(result) == 50
 
-    def test_get_default_encoding(self):
-        with mock.patch("locale.getlocale", side_effect=Exception):
-            self.assertEqual(get_system_encoding(), "ascii")
 
-    def test_repercent_broken_unicode_recursion_error(self):
-        # Prepare a string long enough to force a recursion error if the tested
-        # function uses recursion.
-        data = b"\xfc" * sys.getrecursionlimit()
+@skip_pyarrow
+def test_unicode_encoding(all_parsers, csv_dir_path):
+    path = os.path.join(csv_dir_path, "unicode_series.csv")
+    parser = all_parsers
+
+    result = parser.read_csv(path, header=None, encoding="latin-1")
+    result = result.set_index(0)
+    got = result[1][1632]
+
+    expected = "\xc1 k\xf6ldum klaka (Cold Fever) (1994)"
+    assert got == expected
+
+
+@skip_pyarrow
+@pytest.mark.parametrize(
+    "data,kwargs,expected",
+    [
+        # Basic test
+        ("a\n1", {}, DataFrame({"a": [1]})),
+        # "Regular" quoting
+        ('"a"\n1', {"quotechar": '"'}, DataFrame({"a": [1]})),
+        # Test in a data row instead of header
+        ("b\n1", {"names": ["a"]}, DataFrame({"a": ["b", "1"]})),
+        # Test in empty data row with skipping
+        ("\n1", {"names": ["a"], "skip_blank_lines": True}, DataFrame({"a": [1]})),
+        # Test in empty data row without skipping
+        (
+            "\n1",
+            {"names": ["a"], "skip_blank_lines": False},
+            DataFrame({"a": [np.nan, 1]}),
+        ),
+    ],
+)
+def test_utf8_bom(all_parsers, data, kwargs, expected):
+    # see gh-4793
+    parser = all_parsers
+    bom = "\ufeff"
+    utf8 = "utf-8"
+
+    def _encode_data_with_bom(_data):
+        bom_data = (bom + _data).encode(utf8)
+        return BytesIO(bom_data)
+
+    result = parser.read_csv(_encode_data_with_bom(data), encoding=utf8, **kwargs)
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+def test_read_csv_utf_aliases(all_parsers, utf_value, encoding_fmt):
+    # see gh-13549
+    expected = DataFrame({"mb_num": [4.8], "multibyte": ["test"]})
+    parser = all_parsers
+
+    encoding = encoding_fmt.format(utf_value)
+    data = "mb_num,multibyte\n4.8,test".encode(encoding)
+
+    result = parser.read_csv(BytesIO(data), encoding=encoding)
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+@pytest.mark.parametrize(
+    "file_path,encoding",
+    [
+        (("io", "data", "csv", "test1.csv"), "utf-8"),
+        (("io", "parser", "data", "unicode_series.csv"), "latin-1"),
+        (("io", "parser", "data", "sauron.SHIFT_JIS.csv"), "shiftjis"),
+    ],
+)
+def test_binary_mode_file_buffers(all_parsers, file_path, encoding, datapath):
+    # gh-23779: Python csv engine shouldn't error on files opened in binary.
+    # gh-31575: Python csv engine shouldn't error on files opened in raw binary.
+    parser = all_parsers
+
+    fpath = datapath(*file_path)
+    expected = parser.read_csv(fpath, encoding=encoding)
+
+    with open(fpath, encoding=encoding) as fa:
+        result = parser.read_csv(fa)
+        assert not fa.closed
+    tm.assert_frame_equal(expected, result)
+
+    with open(fpath, mode="rb") as fb:
+        result = parser.read_csv(fb, encoding=encoding)
+        assert not fb.closed
+    tm.assert_frame_equal(expected, result)
+
+    with open(fpath, mode="rb", buffering=0) as fb:
+        result = parser.read_csv(fb, encoding=encoding)
+        assert not fb.closed
+    tm.assert_frame_equal(expected, result)
+
+
+@skip_pyarrow
+@pytest.mark.parametrize("pass_encoding", [True, False])
+def test_encoding_temp_file(all_parsers, utf_value, encoding_fmt, pass_encoding):
+    # see gh-24130
+    parser = all_parsers
+    encoding = encoding_fmt.format(utf_value)
+
+    expected = DataFrame({"foo": ["bar"]})
+
+    with tm.ensure_clean(mode="w+", encoding=encoding, return_filelike=True) as f:
+        f.write("foo\nbar")
+        f.seek(0)
+
+        result = parser.read_csv(f, encoding=encoding if pass_encoding else None)
+        tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+def test_encoding_named_temp_file(all_parsers):
+    # see gh-31819
+    parser = all_parsers
+    encoding = "shift-jis"
+
+    title = "てすと"
+    data = "こむ"
+
+    expected = DataFrame({title: [data]})
+
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(f"{title}\n{data}".encode(encoding))
+
+        f.seek(0)
+
+        result = parser.read_csv(f, encoding=encoding)
+        tm.assert_frame_equal(result, expected)
+        assert not f.closed
+
+
+@pytest.mark.parametrize(
+    "encoding", ["utf-8", "utf-16", "utf-16-be", "utf-16-le", "utf-32"]
+)
+def test_parse_encoded_special_characters(encoding):
+    # GH16218 Verify parsing of data with encoded special characters
+    # Data contains a Unicode 'FULLWIDTH COLON' (U+FF1A) at position (0,"a")
+    data = "a\tb\n：foo\t0\nbar\t1\nbaz\t2"
+    encoded_data = BytesIO(data.encode(encoding))
+    result = read_csv(encoded_data, delimiter="\t", encoding=encoding)
+
+    expected = DataFrame(data=[["：foo", 0], ["bar", 1], ["baz", 2]], columns=["a", "b"])
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+@pytest.mark.parametrize("encoding", ["utf-8", None, "utf-16", "cp1255", "latin-1"])
+def test_encoding_memory_map(all_parsers, encoding):
+    # GH40986
+    parser = all_parsers
+    expected = DataFrame(
+        {
+            "name": ["Raphael", "Donatello", "Miguel Angel", "Leonardo"],
+            "mask": ["red", "purple", "orange", "blue"],
+            "weapon": ["sai", "bo staff", "nunchunk", "katana"],
+        }
+    )
+    with tm.ensure_clean() as file:
+        expected.to_csv(file, index=False, encoding=encoding)
+        df = parser.read_csv(file, encoding=encoding, memory_map=True)
+    tm.assert_frame_equal(df, expected)
+
+
+@skip_pyarrow
+def test_chunk_splits_multibyte_char(all_parsers):
+    """
+    Chunk splits a multibyte character with memory_map=True
+
+    GH 43540
+    """
+    parser = all_parsers
+    # DEFAULT_CHUNKSIZE = 262144, defined in parsers.pyx
+    df = DataFrame(data=["a" * 127] * 2048)
+
+    # Put two-bytes utf-8 encoded character "ą" at the end of chunk
+    # utf-8 encoding of "ą" is b'\xc4\x85'
+    df.iloc[2047] = "a" * 127 + "ą"
+    with tm.ensure_clean("bug-gh43540.csv") as fname:
+        df.to_csv(fname, index=False, header=False, encoding="utf-8")
+        dfr = parser.read_csv(fname, header=None, memory_map=True, engine="c")
+    tm.assert_frame_equal(dfr, df)
+
+
+@skip_pyarrow
+def test_readcsv_memmap_utf8(all_parsers):
+    """
+    GH 43787
+
+    Test correct handling of UTF-8 chars when memory_map=True and encoding is UTF-8
+    """
+    lines = []
+    line_length = 128
+    start_char = " "
+    end_char = "\U00010080"
+    # This for loop creates a list of 128-char strings
+    # consisting of consecutive Unicode chars
+    for lnum in range(ord(start_char), ord(end_char), line_length):
+        line = "".join([chr(c) for c in range(lnum, lnum + 0x80)]) + "\n"
         try:
-            self.assertEqual(
-                repercent_broken_unicode(data), b"%FC" * sys.getrecursionlimit()
-            )
-        except RecursionError:
-            self.fail("Unexpected RecursionError raised.")
-
-
-class TestRFC3987IEncodingUtils(unittest.TestCase):
-    def test_filepath_to_uri(self):
-        self.assertIsNone(filepath_to_uri(None))
-        self.assertEqual(
-            filepath_to_uri("upload\\чубака.mp4"),
-            "upload/%D1%87%D1%83%D0%B1%D0%B0%D0%BA%D0%B0.mp4",
+            line.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+        lines.append(line)
+    parser = all_parsers
+    df = DataFrame(lines)
+    with tm.ensure_clean("utf8test.csv") as fname:
+        df.to_csv(fname, index=False, header=False, encoding="utf-8")
+        dfr = parser.read_csv(
+            fname, header=None, memory_map=True, engine="c", encoding="utf-8"
         )
-        self.assertEqual(filepath_to_uri(Path("upload/test.png")), "upload/test.png")
-        self.assertEqual(filepath_to_uri(Path("upload\\test.png")), "upload/test.png")
+    tm.assert_frame_equal(df, dfr)
 
-    def test_iri_to_uri(self):
-        cases = [
-            # Valid UTF-8 sequences are encoded.
-            ("red%09rosé#red", "red%09ros%C3%A9#red"),
-            ("/blog/for/Jürgen Münster/", "/blog/for/J%C3%BCrgen%20M%C3%BCnster/"),
-            (
-                "locations/%s" % quote_plus("Paris & Orléans"),
-                "locations/Paris+%26+Orl%C3%A9ans",
-            ),
-            # Reserved chars remain unescaped.
-            ("%&", "%&"),
-            ("red&♥ros%#red", "red&%E2%99%A5ros%#red"),
-            (gettext_lazy("red&♥ros%#red"), "red&%E2%99%A5ros%#red"),
-        ]
 
-        for iri, uri in cases:
-            with self.subTest(iri):
-                self.assertEqual(iri_to_uri(iri), uri)
-
-                # Test idempotency.
-                self.assertEqual(iri_to_uri(iri_to_uri(iri)), uri)
-
-    def test_uri_to_iri(self):
-        cases = [
-            (None, None),
-            # Valid UTF-8 sequences are decoded.
-            ("/%e2%89%Ab%E2%99%a5%E2%89%aB/", "/≫♥≫/"),
-            ("/%E2%99%A5%E2%99%A5/?utf8=%E2%9C%93", "/♥♥/?utf8=✓"),
-            ("/%41%5a%6B/", "/AZk/"),
-            # Reserved and non-URL valid ASCII chars are not decoded.
-            ("/%25%20%02%41%7b/", "/%25%20%02A%7b/"),
-            # Broken UTF-8 sequences remain escaped.
-            ("/%AAd%AAj%AAa%AAn%AAg%AAo%AA/", "/%AAd%AAj%AAa%AAn%AAg%AAo%AA/"),
-            ("/%E2%99%A5%E2%E2%99%A5/", "/♥%E2♥/"),
-            ("/%E2%99%A5%E2%99%E2%99%A5/", "/♥%E2%99♥/"),
-            ("/%E2%E2%99%A5%E2%99%A5%99/", "/%E2♥♥%99/"),
-            (
-                "/%E2%99%A5%E2%99%A5/?utf8=%9C%93%E2%9C%93%9C%93",
-                "/♥♥/?utf8=%9C%93✓%9C%93",
-            ),
-        ]
-
-        for uri, iri in cases:
-            with self.subTest(uri):
-                self.assertEqual(uri_to_iri(uri), iri)
-
-                # Test idempotency.
-                self.assertEqual(uri_to_iri(uri_to_iri(uri)), iri)
-
-    def test_complementarity(self):
-        cases = [
-            (
-                "/blog/for/J%C3%BCrgen%20M%C3%BCnster/",
-                "/blog/for/J\xfcrgen%20M\xfcnster/",
-            ),
-            ("%&", "%&"),
-            ("red&%E2%99%A5ros%#red", "red&♥ros%#red"),
-            ("/%E2%99%A5%E2%99%A5/", "/♥♥/"),
-            ("/%E2%99%A5%E2%99%A5/?utf8=%E2%9C%93", "/♥♥/?utf8=✓"),
-            ("/%25%20%02%7b/", "/%25%20%02%7b/"),
-            ("/%AAd%AAj%AAa%AAn%AAg%AAo%AA/", "/%AAd%AAj%AAa%AAn%AAg%AAo%AA/"),
-            ("/%E2%99%A5%E2%E2%99%A5/", "/♥%E2♥/"),
-            ("/%E2%99%A5%E2%99%E2%99%A5/", "/♥%E2%99♥/"),
-            ("/%E2%E2%99%A5%E2%99%A5%99/", "/%E2♥♥%99/"),
-            (
-                "/%E2%99%A5%E2%99%A5/?utf8=%9C%93%E2%9C%93%9C%93",
-                "/♥♥/?utf8=%9C%93✓%9C%93",
-            ),
-        ]
-
-        for uri, iri in cases:
-            with self.subTest(uri):
-                self.assertEqual(iri_to_uri(uri_to_iri(uri)), uri)
-                self.assertEqual(uri_to_iri(iri_to_uri(iri)), iri)
-
-    def test_escape_uri_path(self):
-        cases = [
-            (
-                "/;some/=awful/?path/:with/@lots/&of/+awful/chars",
-                "/%3Bsome/%3Dawful/%3Fpath/:with/@lots/&of/+awful/chars",
-            ),
-            ("/foo#bar", "/foo%23bar"),
-            ("/foo?bar", "/foo%3Fbar"),
-        ]
-        for uri, expected in cases:
-            with self.subTest(uri):
-                self.assertEqual(escape_uri_path(uri), expected)
+@pytest.mark.usefixtures("pyarrow_xfail")
+@pytest.mark.parametrize("mode", ["w+b", "w+t"])
+def test_not_readable(all_parsers, mode):
+    # GH43439
+    parser = all_parsers
+    content = b"abcd"
+    if "t" in mode:
+        content = "abcd"
+    with tempfile.SpooledTemporaryFile(mode=mode) as handle:
+        handle.write(content)
+        handle.seek(0)
+        df = parser.read_csv(handle)
+    expected = DataFrame([], columns=["abcd"])
+    tm.assert_frame_equal(df, expected)

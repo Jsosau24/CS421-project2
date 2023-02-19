@@ -1,95 +1,168 @@
-from django.test import SimpleTestCase
+"""
+Tests that comments are properly handled during parsing
+for all of the parsers defined in parsers.py
+"""
+from io import StringIO
 
-from ..utils import setup
+import numpy as np
+import pytest
+
+from pandas import DataFrame
+import pandas._testing as tm
+
+pytestmark = pytest.mark.usefixtures("pyarrow_skip")
 
 
-class CommentSyntaxTests(SimpleTestCase):
-    @setup({"comment-syntax01": "{# this is hidden #}hello"})
-    def test_comment_syntax01(self):
-        output = self.engine.render_to_string("comment-syntax01")
-        self.assertEqual(output, "hello")
+@pytest.mark.parametrize("na_values", [None, ["NaN"]])
+def test_comment(all_parsers, na_values):
+    parser = all_parsers
+    data = """A,B,C
+1,2.,4.#hello world
+5.,NaN,10.0
+"""
+    expected = DataFrame(
+        [[1.0, 2.0, 4.0], [5.0, np.nan, 10.0]], columns=["A", "B", "C"]
+    )
+    result = parser.read_csv(StringIO(data), comment="#", na_values=na_values)
+    tm.assert_frame_equal(result, expected)
 
-    @setup({"comment-syntax02": "{# this is hidden #}hello{# foo #}"})
-    def test_comment_syntax02(self):
-        output = self.engine.render_to_string("comment-syntax02")
-        self.assertEqual(output, "hello")
 
-    @setup({"comment-syntax03": "foo{#  {% if %}  #}"})
-    def test_comment_syntax03(self):
-        output = self.engine.render_to_string("comment-syntax03")
-        self.assertEqual(output, "foo")
+@pytest.mark.parametrize(
+    "read_kwargs", [{}, {"lineterminator": "*"}, {"delim_whitespace": True}]
+)
+def test_line_comment(all_parsers, read_kwargs, request):
+    parser = all_parsers
+    data = """# empty
+A,B,C
+1,2.,4.#hello world
+#ignore this line
+5.,NaN,10.0
+"""
+    if read_kwargs.get("delim_whitespace"):
+        data = data.replace(",", " ")
+    elif read_kwargs.get("lineterminator"):
+        if parser.engine != "c":
+            mark = pytest.mark.xfail(
+                reason="Custom terminator not supported with Python engine"
+            )
+            request.node.add_marker(mark)
 
-    @setup({"comment-syntax04": "foo{#  {% endblock %}  #}"})
-    def test_comment_syntax04(self):
-        output = self.engine.render_to_string("comment-syntax04")
-        self.assertEqual(output, "foo")
+        data = data.replace("\n", read_kwargs.get("lineterminator"))
 
-    @setup({"comment-syntax05": "foo{#  {% somerandomtag %}  #}"})
-    def test_comment_syntax05(self):
-        output = self.engine.render_to_string("comment-syntax05")
-        self.assertEqual(output, "foo")
+    read_kwargs["comment"] = "#"
+    result = parser.read_csv(StringIO(data), **read_kwargs)
 
-    @setup({"comment-syntax06": "foo{# {% #}"})
-    def test_comment_syntax06(self):
-        output = self.engine.render_to_string("comment-syntax06")
-        self.assertEqual(output, "foo")
+    expected = DataFrame(
+        [[1.0, 2.0, 4.0], [5.0, np.nan, 10.0]], columns=["A", "B", "C"]
+    )
+    tm.assert_frame_equal(result, expected)
 
-    @setup({"comment-syntax07": "foo{# %} #}"})
-    def test_comment_syntax07(self):
-        output = self.engine.render_to_string("comment-syntax07")
-        self.assertEqual(output, "foo")
 
-    @setup({"comment-syntax08": "foo{# %} #}bar"})
-    def test_comment_syntax08(self):
-        output = self.engine.render_to_string("comment-syntax08")
-        self.assertEqual(output, "foobar")
+def test_comment_skiprows(all_parsers):
+    parser = all_parsers
+    data = """# empty
+random line
+# second empty line
+1,2,3
+A,B,C
+1,2.,4.
+5.,NaN,10.0
+"""
+    # This should ignore the first four lines (including comments).
+    expected = DataFrame(
+        [[1.0, 2.0, 4.0], [5.0, np.nan, 10.0]], columns=["A", "B", "C"]
+    )
+    result = parser.read_csv(StringIO(data), comment="#", skiprows=4)
+    tm.assert_frame_equal(result, expected)
 
-    @setup({"comment-syntax09": "foo{# {{ #}"})
-    def test_comment_syntax09(self):
-        output = self.engine.render_to_string("comment-syntax09")
-        self.assertEqual(output, "foo")
 
-    @setup({"comment-syntax10": "foo{# }} #}"})
-    def test_comment_syntax10(self):
-        output = self.engine.render_to_string("comment-syntax10")
-        self.assertEqual(output, "foo")
+def test_comment_header(all_parsers):
+    parser = all_parsers
+    data = """# empty
+# second empty line
+1,2,3
+A,B,C
+1,2.,4.
+5.,NaN,10.0
+"""
+    # Header should begin at the second non-comment line.
+    expected = DataFrame(
+        [[1.0, 2.0, 4.0], [5.0, np.nan, 10.0]], columns=["A", "B", "C"]
+    )
+    result = parser.read_csv(StringIO(data), comment="#", header=1)
+    tm.assert_frame_equal(result, expected)
 
-    @setup({"comment-syntax11": "foo{# { #}"})
-    def test_comment_syntax11(self):
-        output = self.engine.render_to_string("comment-syntax11")
-        self.assertEqual(output, "foo")
 
-    @setup({"comment-syntax12": "foo{# } #}"})
-    def test_comment_syntax12(self):
-        output = self.engine.render_to_string("comment-syntax12")
-        self.assertEqual(output, "foo")
+def test_comment_skiprows_header(all_parsers):
+    parser = all_parsers
+    data = """# empty
+# second empty line
+# third empty line
+X,Y,Z
+1,2,3
+A,B,C
+1,2.,4.
+5.,NaN,10.0
+"""
+    # Skiprows should skip the first 4 lines (including comments),
+    # while header should start from the second non-commented line,
+    # starting with line 5.
+    expected = DataFrame(
+        [[1.0, 2.0, 4.0], [5.0, np.nan, 10.0]], columns=["A", "B", "C"]
+    )
+    result = parser.read_csv(StringIO(data), comment="#", skiprows=4, header=1)
+    tm.assert_frame_equal(result, expected)
 
-    @setup({"comment-tag01": "{% comment %}this is hidden{% endcomment %}hello"})
-    def test_comment_tag01(self):
-        output = self.engine.render_to_string("comment-tag01")
-        self.assertEqual(output, "hello")
 
-    @setup(
+@pytest.mark.parametrize("comment_char", ["#", "~", "&", "^", "*", "@"])
+def test_custom_comment_char(all_parsers, comment_char):
+    parser = all_parsers
+    data = "a,b,c\n1,2,3#ignore this!\n4,5,6#ignorethistoo"
+    result = parser.read_csv(
+        StringIO(data.replace("#", comment_char)), comment=comment_char
+    )
+
+    expected = DataFrame([[1, 2, 3], [4, 5, 6]], columns=["a", "b", "c"])
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("header", ["infer", None])
+def test_comment_first_line(all_parsers, header):
+    # see gh-4623
+    parser = all_parsers
+    data = "# notes\na,b,c\n# more notes\n1,2,3"
+
+    if header is None:
+        expected = DataFrame({0: ["a", "1"], 1: ["b", "2"], 2: ["c", "3"]})
+    else:
+        expected = DataFrame([[1, 2, 3]], columns=["a", "b", "c"])
+
+    result = parser.read_csv(StringIO(data), comment="#", header=header)
+    tm.assert_frame_equal(result, expected)
+
+
+def test_comment_char_in_default_value(all_parsers, request):
+    # GH#34002
+    if all_parsers.engine == "c":
+        reason = "see gh-34002: works on the python engine but not the c engine"
+        # NA value containing comment char is interpreted as comment
+        request.node.add_marker(pytest.mark.xfail(reason=reason, raises=AssertionError))
+    parser = all_parsers
+
+    data = (
+        "# this is a comment\n"
+        "col1,col2,col3,col4\n"
+        "1,2,3,4#inline comment\n"
+        "4,5#,6,10\n"
+        "7,8,#N/A,11\n"
+    )
+    result = parser.read_csv(StringIO(data), comment="#", na_values="#N/A")
+    expected = DataFrame(
         {
-            "comment-tag02": "{% comment %}this is hidden{% endcomment %}"
-            "hello{% comment %}foo{% endcomment %}"
+            "col1": [1, 4, 7],
+            "col2": [2, 5, 8],
+            "col3": [3.0, np.nan, np.nan],
+            "col4": [4.0, np.nan, 11.0],
         }
     )
-    def test_comment_tag02(self):
-        output = self.engine.render_to_string("comment-tag02")
-        self.assertEqual(output, "hello")
-
-    @setup({"comment-tag03": "foo{% comment %} {% if %} {% endcomment %}"})
-    def test_comment_tag03(self):
-        output = self.engine.render_to_string("comment-tag03")
-        self.assertEqual(output, "foo")
-
-    @setup({"comment-tag04": "foo{% comment %} {% endblock %} {% endcomment %}"})
-    def test_comment_tag04(self):
-        output = self.engine.render_to_string("comment-tag04")
-        self.assertEqual(output, "foo")
-
-    @setup({"comment-tag05": "foo{% comment %} {% somerandomtag %} {% endcomment %}"})
-    def test_comment_tag05(self):
-        output = self.engine.render_to_string("comment-tag05")
-        self.assertEqual(output, "foo")
+    tm.assert_frame_equal(result, expected)

@@ -1,35 +1,34 @@
-from django.db import connection
-from django.db.models import Value
-from django.db.models.functions import Length, Repeat
-from django.test import TestCase
+import numpy as np
 
-from ..models import Author
+from pandas import (
+    TimedeltaIndex,
+    timedelta_range,
+)
+import pandas._testing as tm
 
 
-class RepeatTests(TestCase):
-    def test_basic(self):
-        Author.objects.create(name="John", alias="xyz")
-        none_value = (
-            "" if connection.features.interprets_empty_strings_as_nulls else None
+class TestRepeat:
+    def test_repeat(self):
+        index = timedelta_range("1 days", periods=2, freq="D")
+        exp = TimedeltaIndex(["1 days", "1 days", "2 days", "2 days"])
+        for res in [index.repeat(2), np.repeat(index, 2)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None
+
+        index = TimedeltaIndex(["1 days", "NaT", "3 days"])
+        exp = TimedeltaIndex(
+            [
+                "1 days",
+                "1 days",
+                "1 days",
+                "NaT",
+                "NaT",
+                "NaT",
+                "3 days",
+                "3 days",
+                "3 days",
+            ]
         )
-        tests = (
-            (Repeat("name", 0), ""),
-            (Repeat("name", 2), "JohnJohn"),
-            (Repeat("name", Length("alias")), "JohnJohnJohn"),
-            (Repeat(Value("x"), 3), "xxx"),
-            (Repeat("name", None), none_value),
-            (Repeat(Value(None), 4), none_value),
-            (Repeat("goes_by", 1), none_value),
-        )
-        for function, repeated_text in tests:
-            with self.subTest(function=function):
-                authors = Author.objects.annotate(repeated_text=function)
-                self.assertQuerySetEqual(
-                    authors, [repeated_text], lambda a: a.repeated_text, ordered=False
-                )
-
-    def test_negative_number(self):
-        with self.assertRaisesMessage(
-            ValueError, "'number' must be greater or equal to 0."
-        ):
-            Repeat("name", -1)
+        for res in [index.repeat(3), np.repeat(index, 3)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None

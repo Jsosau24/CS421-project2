@@ -1,34 +1,28 @@
-"""
- This module is for the miscellaneous GEOS routines, particularly the
- ones that return the area, distance, and length.
-"""
-from ctypes import POINTER, c_double, c_int
+# This file is not meant for public use and will be removed in SciPy v2.0.0.
+# Use the `scipy.linalg` namespace for importing the functions
+# included below.
 
-from django.contrib.gis.geos.libgeos import GEOM_PTR, GEOSFuncFactory
-from django.contrib.gis.geos.prototypes.errcheck import check_dbl, check_string
-from django.contrib.gis.geos.prototypes.geom import geos_char_p
+import warnings
+from . import _misc
 
-__all__ = ["geos_area", "geos_distance", "geos_length", "geos_isvalidreason"]
-
-
-class DblFromGeom(GEOSFuncFactory):
-    """
-    Argument is a Geometry, return type is double that is passed
-    in by reference as the last argument.
-    """
-
-    restype = c_int  # Status code returned
-    errcheck = staticmethod(check_dbl)
+__all__ = [  # noqa: F822
+    'LinAlgError', 'LinAlgWarning', 'norm', 'get_blas_funcs',
+    'get_lapack_funcs'
+]
 
 
-# ### ctypes prototypes ###
+def __dir__():
+    return __all__
 
-# Area, distance, and length prototypes.
-geos_area = DblFromGeom("GEOSArea", argtypes=[GEOM_PTR, POINTER(c_double)])
-geos_distance = DblFromGeom(
-    "GEOSDistance", argtypes=[GEOM_PTR, GEOM_PTR, POINTER(c_double)]
-)
-geos_length = DblFromGeom("GEOSLength", argtypes=[GEOM_PTR, POINTER(c_double)])
-geos_isvalidreason = GEOSFuncFactory(
-    "GEOSisValidReason", restype=geos_char_p, errcheck=check_string, argtypes=[GEOM_PTR]
-)
+
+def __getattr__(name):
+    if name not in __all__:
+        raise AttributeError(
+            "scipy.linalg.misc is deprecated and has no attribute "
+            f"{name}. Try looking in scipy.linalg instead.")
+
+    warnings.warn(f"Please use `{name}` from the `scipy.linalg` namespace, "
+                  "the `scipy.linalg.misc` namespace is deprecated.",
+                  category=DeprecationWarning, stacklevel=2)
+
+    return getattr(_misc, name)

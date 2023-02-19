@@ -1,54 +1,56 @@
-from functools import partial
+import typing as t
 
-from django.db.models.utils import make_model_tuple
-from django.dispatch import Signal
+try:
+    from blinker import Namespace
 
-class_prepared = Signal()
+    signals_available = True
+except ImportError:
+    signals_available = False
 
+    class Namespace:  # type: ignore
+        def signal(self, name: str, doc: t.Optional[str] = None) -> "_FakeSignal":
+            return _FakeSignal(name, doc)
 
-class ModelSignal(Signal):
-    """
-    Signal subclass that allows the sender to be lazily specified as a string
-    of the `app_label.ModelName` form.
-    """
+    class _FakeSignal:
+        """If blinker is unavailable, create a fake class with the same
+        interface that allows sending of signals but will fail with an
+        error on anything else.  Instead of doing anything on send, it
+        will just ignore the arguments and do nothing instead.
+        """
 
-    def _lazy_method(self, method, apps, receiver, sender, **kwargs):
-        from django.db.models.options import Options
+        def __init__(self, name: str, doc: t.Optional[str] = None) -> None:
+            self.name = name
+            self.__doc__ = doc
 
-        # This partial takes a single optional argument named "sender".
-        partial_method = partial(method, receiver, **kwargs)
-        if isinstance(sender, str):
-            apps = apps or Options.default_apps
-            apps.lazy_model_operation(partial_method, make_model_tuple(sender))
-        else:
-            return partial_method(sender)
+        def send(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+            pass
 
-    def connect(self, receiver, sender=None, weak=True, dispatch_uid=None, apps=None):
-        self._lazy_method(
-            super().connect,
-            apps,
-            receiver,
-            sender,
-            weak=weak,
-            dispatch_uid=dispatch_uid,
-        )
+        def _fail(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+            raise RuntimeError(
+                "Signalling support is unavailable because the blinker"
+                " library is not installed."
+            ) from None
 
-    def disconnect(self, receiver=None, sender=None, dispatch_uid=None, apps=None):
-        return self._lazy_method(
-            super().disconnect, apps, receiver, sender, dispatch_uid=dispatch_uid
-        )
+        connect = connect_via = connected_to = temporarily_connected_to = _fail
+        disconnect = _fail
+        has_receivers_for = receivers_for = _fail
+        del _fail
 
 
-pre_init = ModelSignal(use_caching=True)
-post_init = ModelSignal(use_caching=True)
+# The namespace for code signals.  If you are not Flask code, do
+# not put signals in here.  Create your own namespace instead.
+_signals = Namespace()
 
-pre_save = ModelSignal(use_caching=True)
-post_save = ModelSignal(use_caching=True)
 
-pre_delete = ModelSignal(use_caching=True)
-post_delete = ModelSignal(use_caching=True)
-
-m2m_changed = ModelSignal(use_caching=True)
-
-pre_migrate = Signal()
-post_migrate = Signal()
+# Core signals.  For usage examples grep the source code or consult
+# the API documentation in docs/api.rst as well as docs/signals.rst
+template_rendered = _signals.signal("template-rendered")
+before_render_template = _signals.signal("before-render-template")
+request_started = _signals.signal("request-started")
+request_finished = _signals.signal("request-finished")
+request_tearing_down = _signals.signal("request-tearing-down")
+got_request_exception = _signals.signal("got-request-exception")
+appcontext_tearing_down = _signals.signal("appcontext-tearing-down")
+appcontext_pushed = _signals.signal("appcontext-pushed")
+appcontext_popped = _signals.signal("appcontext-popped")
+message_flashed = _signals.signal("message-flashed")

@@ -1,58 +1,108 @@
-import datetime
-from unittest import mock
+"""
+Tests that work on both the Python and C engines but do not have a
+specific classification into the other test modules.
+"""
+from io import StringIO
 
-from django.db import connections
-from django.db.models.sql.compiler import cursor_iter
-from django.test import TestCase
+import pytest
 
-from .models import Article
+from pandas import (
+    DataFrame,
+    concat,
+)
+import pandas._testing as tm
+
+pytestmark = pytest.mark.usefixtures("pyarrow_skip")
 
 
-class QuerySetIteratorTests(TestCase):
-    itersize_index_in_mock_args = 3
+def test_iterator(all_parsers):
+    # see gh-6607
+    data = """index,A,B,C,D
+foo,2,3,4,5
+bar,7,8,9,10
+baz,12,13,14,15
+qux,12,13,14,15
+foo2,12,13,14,15
+bar2,12,13,14,15
+"""
+    parser = all_parsers
+    kwargs = {"index_col": 0}
 
-    @classmethod
-    def setUpTestData(cls):
-        Article.objects.create(name="Article 1", created=datetime.datetime.now())
-        Article.objects.create(name="Article 2", created=datetime.datetime.now())
+    expected = parser.read_csv(StringIO(data), **kwargs)
+    with parser.read_csv(StringIO(data), iterator=True, **kwargs) as reader:
+        first_chunk = reader.read(3)
+        tm.assert_frame_equal(first_chunk, expected[:3])
 
-    def test_iterator_invalid_chunk_size(self):
-        for size in (0, -1):
-            with self.subTest(size=size):
-                with self.assertRaisesMessage(
-                    ValueError, "Chunk size must be strictly positive."
-                ):
-                    Article.objects.iterator(chunk_size=size)
+        last_chunk = reader.read(5)
+    tm.assert_frame_equal(last_chunk, expected[3:])
 
-    def test_default_iterator_chunk_size(self):
-        qs = Article.objects.iterator()
-        with mock.patch(
-            "django.db.models.sql.compiler.cursor_iter", side_effect=cursor_iter
-        ) as cursor_iter_mock:
-            next(qs)
-        self.assertEqual(cursor_iter_mock.call_count, 1)
-        mock_args, _mock_kwargs = cursor_iter_mock.call_args
-        self.assertEqual(mock_args[self.itersize_index_in_mock_args], 2000)
 
-    def test_iterator_chunk_size(self):
-        batch_size = 3
-        qs = Article.objects.iterator(chunk_size=batch_size)
-        with mock.patch(
-            "django.db.models.sql.compiler.cursor_iter", side_effect=cursor_iter
-        ) as cursor_iter_mock:
-            next(qs)
-        self.assertEqual(cursor_iter_mock.call_count, 1)
-        mock_args, _mock_kwargs = cursor_iter_mock.call_args
-        self.assertEqual(mock_args[self.itersize_index_in_mock_args], batch_size)
+def test_iterator2(all_parsers):
+    parser = all_parsers
+    data = """A,B,C
+foo,1,2,3
+bar,4,5,6
+baz,7,8,9
+"""
 
-    def test_no_chunked_reads(self):
-        """
-        If the database backend doesn't support chunked reads, then the
-        result of SQLCompiler.execute_sql() is a list.
-        """
-        qs = Article.objects.all()
-        compiler = qs.query.get_compiler(using=qs.db)
-        features = connections[qs.db].features
-        with mock.patch.object(features, "can_use_chunked_reads", False):
-            result = compiler.execute_sql(chunked_fetch=True)
-        self.assertIsInstance(result, list)
+    with parser.read_csv(StringIO(data), iterator=True) as reader:
+        result = list(reader)
+
+    expected = DataFrame(
+        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        index=["foo", "bar", "baz"],
+        columns=["A", "B", "C"],
+    )
+    tm.assert_frame_equal(result[0], expected)
+
+
+def test_iterator_stop_on_chunksize(all_parsers):
+    # gh-3967: stopping iteration when chunksize is specified
+    parser = all_parsers
+    data = """A,B,C
+foo,1,2,3
+bar,4,5,6
+baz,7,8,9
+"""
+
+    with parser.read_csv(StringIO(data), chunksize=1) as reader:
+        result = list(reader)
+
+    assert len(result) == 3
+    expected = DataFrame(
+        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        index=["foo", "bar", "baz"],
+        columns=["A", "B", "C"],
+    )
+    tm.assert_frame_equal(concat(result), expected)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"iterator": True, "chunksize": 1}, {"iterator": True}, {"chunksize": 1}]
+)
+def test_iterator_skipfooter_errors(all_parsers, kwargs):
+    msg = "'skipfooter' not supported for iteration"
+    parser = all_parsers
+    data = "a\n1\n2"
+
+    with pytest.raises(ValueError, match=msg):
+        with parser.read_csv(StringIO(data), skipfooter=1, **kwargs) as _:
+            pass
+
+
+def test_iteration_open_handle(all_parsers):
+    parser = all_parsers
+    kwargs = {"header": None}
+
+    with tm.ensure_clean() as path:
+        with open(path, "w") as f:
+            f.write("AAA\nBBB\nCCC\nDDD\nEEE\nFFF\nGGG")
+
+        with open(path) as f:
+            for line in f:
+                if "CCC" in line:
+                    break
+
+            result = parser.read_csv(f, **kwargs)
+            expected = DataFrame({0: ["DDD", "EEE", "FFF", "GGG"]})
+            tm.assert_frame_equal(result, expected)

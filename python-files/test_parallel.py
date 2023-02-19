@@ -1,135 +1,101 @@
-import pickle
-import sys
-import unittest
+import time
 
-from django.test import SimpleTestCase
-from django.test.runner import RemoteTestResult
-from django.utils.version import PY311
+import joblib
+import numpy as np
+import pytest
+from numpy.testing import assert_array_equal
 
-try:
-    import tblib.pickling_support
-except ImportError:
-    tblib = None
+from sklearn import config_context, get_config
+from sklearn.compose import make_column_transformer
+from sklearn.datasets import load_iris
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-
-class ExceptionThatFailsUnpickling(Exception):
-    """
-    After pickling, this class fails unpickling with an error about incorrect
-    arguments passed to __init__().
-    """
-
-    def __init__(self, arg):
-        super().__init__()
+from sklearn.utils.parallel import delayed, Parallel
 
 
-class ParallelTestRunnerTest(SimpleTestCase):
-    """
-    End-to-end tests of the parallel test runner.
-
-    These tests are only meaningful when running tests in parallel using
-    the --parallel option, though it doesn't hurt to run them not in
-    parallel.
-    """
-
-    def test_subtest(self):
-        """
-        Passing subtests work.
-        """
-        for i in range(2):
-            with self.subTest(index=i):
-                self.assertEqual(i, i)
+def get_working_memory():
+    return get_config()["working_memory"]
 
 
-class SampleFailingSubtest(SimpleTestCase):
-    # This method name doesn't begin with "test" to prevent test discovery
-    # from seeing it.
-    def dummy_test(self):
-        """
-        A dummy test for testing subTest failures.
-        """
-        for i in range(3):
-            with self.subTest(index=i):
-                self.assertEqual(i, 1)
+@pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.parametrize("backend", ["loky", "threading", "multiprocessing"])
+def test_configuration_passes_through_to_joblib(n_jobs, backend):
+    # Tests that the global global configuration is passed to joblib jobs
 
-
-class RemoteTestResultTest(SimpleTestCase):
-    def _test_error_exc_info(self):
-        try:
-            raise ValueError("woops")
-        except ValueError:
-            return sys.exc_info()
-
-    def test_was_successful_no_events(self):
-        result = RemoteTestResult()
-        self.assertIs(result.wasSuccessful(), True)
-
-    def test_was_successful_one_success(self):
-        result = RemoteTestResult()
-        result.addSuccess(None)
-        self.assertIs(result.wasSuccessful(), True)
-
-    def test_was_successful_one_expected_failure(self):
-        result = RemoteTestResult()
-        result.addExpectedFailure(None, self._test_error_exc_info())
-        self.assertIs(result.wasSuccessful(), True)
-
-    def test_was_successful_one_skip(self):
-        result = RemoteTestResult()
-        result.addSkip(None, "Skipped")
-        self.assertIs(result.wasSuccessful(), True)
-
-    @unittest.skipUnless(tblib is not None, "requires tblib to be installed")
-    def test_was_successful_one_error(self):
-        result = RemoteTestResult()
-        result.addError(None, self._test_error_exc_info())
-        self.assertIs(result.wasSuccessful(), False)
-
-    @unittest.skipUnless(tblib is not None, "requires tblib to be installed")
-    def test_was_successful_one_failure(self):
-        result = RemoteTestResult()
-        result.addFailure(None, self._test_error_exc_info())
-        self.assertIs(result.wasSuccessful(), False)
-
-    def test_picklable(self):
-        result = RemoteTestResult()
-        loaded_result = pickle.loads(pickle.dumps(result))
-        self.assertEqual(result.events, loaded_result.events)
-
-    def test_pickle_errors_detection(self):
-        picklable_error = RuntimeError("This is fine")
-        not_unpicklable_error = ExceptionThatFailsUnpickling("arg")
-
-        result = RemoteTestResult()
-        result._confirm_picklable(picklable_error)
-
-        msg = "__init__() missing 1 required positional argument"
-        with self.assertRaisesMessage(TypeError, msg):
-            result._confirm_picklable(not_unpicklable_error)
-
-    @unittest.skipUnless(tblib is not None, "requires tblib to be installed")
-    def test_add_failing_subtests(self):
-        """
-        Failing subtests are added correctly using addSubTest().
-        """
-        # Manually run a test with failing subtests to prevent the failures
-        # from affecting the actual test run.
-        result = RemoteTestResult()
-        subtest_test = SampleFailingSubtest(methodName="dummy_test")
-        subtest_test.run(result=result)
-
-        events = result.events
-        self.assertEqual(len(events), 4)
-        self.assertIs(result.wasSuccessful(), False)
-
-        event = events[1]
-        self.assertEqual(event[0], "addSubTest")
-        self.assertEqual(
-            str(event[2]),
-            "dummy_test (test_runner.test_parallel.SampleFailingSubtest%s) (index=0)"
-            # Python 3.11 uses fully qualified test name in the output.
-            % (".dummy_test" if PY311 else ""),
+    with config_context(working_memory=123):
+        results = Parallel(n_jobs=n_jobs, backend=backend)(
+            delayed(get_working_memory)() for _ in range(2)
         )
-        self.assertEqual(repr(event[3][1]), "AssertionError('0 != 1')")
 
-        event = events[2]
-        self.assertEqual(repr(event[3][1]), "AssertionError('2 != 1')")
+    assert_array_equal(results, [123] * 2)
+
+
+def test_parallel_delayed_warnings():
+    """Informative warnings should be raised when mixing sklearn and joblib API"""
+    # We should issue a warning when one wants to use sklearn.utils.fixes.Parallel
+    # with joblib.delayed. The config will not be propagated to the workers.
+    warn_msg = "`sklearn.utils.parallel.Parallel` needs to be used in conjunction"
+    with pytest.warns(UserWarning, match=warn_msg) as records:
+        Parallel()(joblib.delayed(time.sleep)(0) for _ in range(10))
+    assert len(records) == 10
+
+    # We should issue a warning if one wants to use sklearn.utils.fixes.delayed with
+    # joblib.Parallel
+    warn_msg = (
+        "`sklearn.utils.parallel.delayed` should be used with "
+        "`sklearn.utils.parallel.Parallel` to make it possible to propagate"
+    )
+    with pytest.warns(UserWarning, match=warn_msg) as records:
+        joblib.Parallel()(delayed(time.sleep)(0) for _ in range(10))
+    assert len(records) == 10
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_dispatch_config_parallel(n_jobs):
+    """Check that we properly dispatch the configuration in parallel processing.
+
+    Non-regression test for:
+    https://github.com/scikit-learn/scikit-learn/issues/25239
+    """
+    pd = pytest.importorskip("pandas")
+    iris = load_iris(as_frame=True)
+
+    class TransformerRequiredDataFrame(StandardScaler):
+        def fit(self, X, y=None):
+            assert isinstance(X, pd.DataFrame), "X should be a DataFrame"
+            return super().fit(X, y)
+
+        def transform(self, X, y=None):
+            assert isinstance(X, pd.DataFrame), "X should be a DataFrame"
+            return super().transform(X, y)
+
+    dropper = make_column_transformer(
+        ("drop", [0]),
+        remainder="passthrough",
+        n_jobs=n_jobs,
+    )
+    param_grid = {"randomforestclassifier__max_depth": [1, 2, 3]}
+    search_cv = GridSearchCV(
+        make_pipeline(
+            dropper,
+            TransformerRequiredDataFrame(),
+            RandomForestClassifier(n_estimators=5, n_jobs=n_jobs),
+        ),
+        param_grid,
+        cv=5,
+        n_jobs=n_jobs,
+        error_score="raise",  # this search should not fail
+    )
+
+    # make sure that `fit` would fail in case we don't request dataframe
+    with pytest.raises(AssertionError, match="X should be a DataFrame"):
+        search_cv.fit(iris.data, iris.target)
+
+    with config_context(transform_output="pandas"):
+        # we expect each intermediate steps to output a DataFrame
+        search_cv.fit(iris.data, iris.target)
+
+    assert not np.isnan(search_cv.cv_results_["mean_test_score"]).any()

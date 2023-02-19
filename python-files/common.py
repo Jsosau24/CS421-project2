@@ -1,17 +1,24 @@
-from functools import wraps
+"""
+Common utilities for testing model selection.
+"""
+
+import numpy as np
+
+from sklearn.model_selection import KFold
 
 
-def no_append_slash(view_func):
-    """
-    Mark a view function as excluded from CommonMiddleware's APPEND_SLASH
-    redirection.
-    """
+class OneTimeSplitter:
+    """A wrapper to make KFold single entry cv iterator"""
 
-    # view_func.should_append_slash = False would also work, but decorators are
-    # nicer if they don't have side effects, so return a new function.
-    @wraps(view_func)
-    def wrapper_view(*args, **kwargs):
-        return view_func(*args, **kwargs)
+    def __init__(self, n_splits=4, n_samples=99):
+        self.n_splits = n_splits
+        self.n_samples = n_samples
+        self.indices = iter(KFold(n_splits=n_splits).split(np.ones(n_samples)))
 
-    wrapper_view.should_append_slash = False
-    return wrapper_view
+    def split(self, X=None, y=None, groups=None):
+        """Split can be called only once"""
+        for index in self.indices:
+            yield index
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits

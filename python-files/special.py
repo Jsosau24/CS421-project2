@@ -1,208 +1,169 @@
-from django.db import router
+import numpy as np
 
-from .base import Operation
+from .common import Benchmark, with_attributes, safe_import
 
-
-class SeparateDatabaseAndState(Operation):
-    """
-    Take two lists of operations - ones that will be used for the database,
-    and ones that will be used for the state change. This allows operations
-    that don't support state change to have it applied, or have operations
-    that affect the state or not the database, or so on.
-    """
-
-    serialization_expand_args = ["database_operations", "state_operations"]
-
-    def __init__(self, database_operations=None, state_operations=None):
-        self.database_operations = database_operations or []
-        self.state_operations = state_operations or []
-
-    def deconstruct(self):
-        kwargs = {}
-        if self.database_operations:
-            kwargs["database_operations"] = self.database_operations
-        if self.state_operations:
-            kwargs["state_operations"] = self.state_operations
-        return (self.__class__.__qualname__, [], kwargs)
-
-    def state_forwards(self, app_label, state):
-        for state_operation in self.state_operations:
-            state_operation.state_forwards(app_label, state)
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        # We calculate state separately in here since our state functions aren't useful
-        for database_operation in self.database_operations:
-            to_state = from_state.clone()
-            database_operation.state_forwards(app_label, to_state)
-            database_operation.database_forwards(
-                app_label, schema_editor, from_state, to_state
-            )
-            from_state = to_state
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        # We calculate state separately in here since our state functions aren't useful
-        to_states = {}
-        for dbop in self.database_operations:
-            to_states[dbop] = to_state
-            to_state = to_state.clone()
-            dbop.state_forwards(app_label, to_state)
-        # to_state now has the states of all the database_operations applied
-        # which is the from_state for the backwards migration of the last
-        # operation.
-        for database_operation in reversed(self.database_operations):
-            from_state = to_state
-            to_state = to_states[database_operation]
-            database_operation.database_backwards(
-                app_label, schema_editor, from_state, to_state
-            )
-
-    def describe(self):
-        return "Custom state/database change combination"
+with safe_import():
+    from scipy.special import (
+        ai_zeros,
+        bi_zeros,
+        erf,
+        expn,
+        factorial,
+        factorial2,
+        factorialk,
+    )
+with safe_import():
+    # wasn't always in scipy.special, so import separately
+    from scipy.special import comb
+with safe_import():
+    from scipy.special import loggamma
 
 
-class RunSQL(Operation):
-    """
-    Run some raw SQL. A reverse SQL statement may be provided.
+class Airy(Benchmark):
+    def time_ai_zeros(self):
+        ai_zeros(100000)
 
-    Also accept a list of operations that represent the state change effected
-    by this SQL change, in case it's custom column/table creation/deletion.
-    """
-
-    noop = ""
-
-    def __init__(
-        self, sql, reverse_sql=None, state_operations=None, hints=None, elidable=False
-    ):
-        self.sql = sql
-        self.reverse_sql = reverse_sql
-        self.state_operations = state_operations or []
-        self.hints = hints or {}
-        self.elidable = elidable
-
-    def deconstruct(self):
-        kwargs = {
-            "sql": self.sql,
-        }
-        if self.reverse_sql is not None:
-            kwargs["reverse_sql"] = self.reverse_sql
-        if self.state_operations:
-            kwargs["state_operations"] = self.state_operations
-        if self.hints:
-            kwargs["hints"] = self.hints
-        return (self.__class__.__qualname__, [], kwargs)
-
-    @property
-    def reversible(self):
-        return self.reverse_sql is not None
-
-    def state_forwards(self, app_label, state):
-        for state_operation in self.state_operations:
-            state_operation.state_forwards(app_label, state)
-
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        if router.allow_migrate(
-            schema_editor.connection.alias, app_label, **self.hints
-        ):
-            self._run_sql(schema_editor, self.sql)
-
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if self.reverse_sql is None:
-            raise NotImplementedError("You cannot reverse this operation")
-        if router.allow_migrate(
-            schema_editor.connection.alias, app_label, **self.hints
-        ):
-            self._run_sql(schema_editor, self.reverse_sql)
-
-    def describe(self):
-        return "Raw SQL operation"
-
-    def _run_sql(self, schema_editor, sqls):
-        if isinstance(sqls, (list, tuple)):
-            for sql in sqls:
-                params = None
-                if isinstance(sql, (list, tuple)):
-                    elements = len(sql)
-                    if elements == 2:
-                        sql, params = sql
-                    else:
-                        raise ValueError("Expected a 2-tuple but got %d" % elements)
-                schema_editor.execute(sql, params=params)
-        elif sqls != RunSQL.noop:
-            statements = schema_editor.connection.ops.prepare_sql_script(sqls)
-            for statement in statements:
-                schema_editor.execute(statement, params=None)
+    def time_bi_zeros(self):
+        bi_zeros(100000)
 
 
-class RunPython(Operation):
-    """
-    Run Python code in a context suitable for doing versioned ORM operations.
-    """
+class Erf(Benchmark):
+    def setup(self, *args):
+        self.rand = np.random.rand(100000)
 
-    reduces_to_sql = False
+    def time_real(self, offset):
+        erf(self.rand + offset)
 
-    def __init__(
-        self, code, reverse_code=None, atomic=None, hints=None, elidable=False
-    ):
-        self.atomic = atomic
-        # Forwards code
-        if not callable(code):
-            raise ValueError("RunPython must be supplied with a callable")
-        self.code = code
-        # Reverse code
-        if reverse_code is None:
-            self.reverse_code = None
-        else:
-            if not callable(reverse_code):
-                raise ValueError("RunPython must be supplied with callable arguments")
-            self.reverse_code = reverse_code
-        self.hints = hints or {}
-        self.elidable = elidable
+    time_real.params = [0.0, 2.0]
+    time_real.param_names = ['offset']
 
-    def deconstruct(self):
-        kwargs = {
-            "code": self.code,
-        }
-        if self.reverse_code is not None:
-            kwargs["reverse_code"] = self.reverse_code
-        if self.atomic is not None:
-            kwargs["atomic"] = self.atomic
-        if self.hints:
-            kwargs["hints"] = self.hints
-        return (self.__class__.__qualname__, [], kwargs)
 
-    @property
-    def reversible(self):
-        return self.reverse_code is not None
+class Comb(Benchmark):
 
-    def state_forwards(self, app_label, state):
-        # RunPython objects have no state effect. To add some, combine this
-        # with SeparateDatabaseAndState.
-        pass
+    def setup(self, *args):
+        self.N = np.arange(1, 1000, 50)
+        self.k = np.arange(1, 1000, 50)
 
-    def database_forwards(self, app_label, schema_editor, from_state, to_state):
-        # RunPython has access to all models. Ensure that all models are
-        # reloaded in case any are delayed.
-        from_state.clear_delayed_apps_cache()
-        if router.allow_migrate(
-            schema_editor.connection.alias, app_label, **self.hints
-        ):
-            # We now execute the Python code in a context that contains a 'models'
-            # object, representing the versioned models as an app registry.
-            # We could try to override the global cache, but then people will still
-            # use direct imports, so we go with a documentation approach instead.
-            self.code(from_state.apps, schema_editor)
+    @with_attributes(params=[(10, 100, 1000, 10000), (1, 10, 100)],
+                     param_names=['N', 'k'])
+    def time_comb_exact(self, N, k):
+        comb(N, k, exact=True)
 
-    def database_backwards(self, app_label, schema_editor, from_state, to_state):
-        if self.reverse_code is None:
-            raise NotImplementedError("You cannot reverse this operation")
-        if router.allow_migrate(
-            schema_editor.connection.alias, app_label, **self.hints
-        ):
-            self.reverse_code(from_state.apps, schema_editor)
+    def time_comb_float(self):
+        comb(self.N[:,None], self.k[None,:])
 
-    def describe(self):
-        return "Raw Python operation"
 
-    @staticmethod
-    def noop(apps, schema_editor):
-        return None
+class Loggamma(Benchmark):
+
+    def setup(self):
+        x, y = np.logspace(3, 5, 10), np.logspace(3, 5, 10)
+        x, y = np.meshgrid(x, y)
+        self.large_z = x + 1j*y
+
+    def time_loggamma_asymptotic(self):
+        loggamma(self.large_z)
+
+
+class Expn(Benchmark):
+
+    def setup(self):
+        n, x = np.arange(50, 500), np.logspace(0, 20, 100)
+        n, x = np.meshgrid(n, x)
+        self.n, self.x = n, x
+
+    def time_expn_large_n(self):
+        expn(self.n, self.x)
+
+
+class Factorial(Benchmark):
+    def setup(self, *args):
+        self.positive_ints = np.arange(10, 111, step=20, dtype=int)
+        self.negative_ints = -1 * self.positive_ints
+        self.positive_floats = np.linspace(100.2, 1000.8, num=10)
+        self.negative_floats = -1 * self.positive_floats
+
+    @with_attributes(params=[(100, 1000, 10000)],
+                     param_names=['n'])
+    def time_factorial_exact_false_scalar_positive_int(self, n):
+        factorial(n, exact=False)
+
+    def time_factorial_exact_false_scalar_negative_int(self):
+        factorial(-10000, exact=False)
+
+    @with_attributes(params=[(100.8, 1000.3, 10000.5)],
+                     param_names=['n'])
+    def time_factorial_exact_false_scalar_positive_float(self, n):
+        factorial(n, exact=False)
+
+    def time_factorial_exact_false_scalar_negative_float(self):
+        factorial(-10000.8, exact=False)
+
+    def time_factorial_exact_false_array_positive_int(self):
+        factorial(self.positive_ints, exact=False)
+
+    def time_factorial_exact_false_array_negative_int(self):
+        factorial(self.negative_ints, exact=False)
+
+    def time_factorial_exact_false_array_positive_float(self):
+        factorial(self.positive_floats, exact=False)
+
+    def time_factorial_exact_false_array_negative_float(self):
+        factorial(self.negative_floats, exact=False)
+
+    @with_attributes(params=[(100, 200, 400)],
+                     param_names=['n'])
+    def time_factorial_exact_true_scalar_positive_int(self, n):
+        factorial(n, exact=True)
+
+    def time_factorial_exact_true_scalar_negative_int(self):
+        factorial(-10000, exact=True)
+
+    def time_factorial_exact_true_scalar_negative_float(self):
+        factorial(-10000.8, exact=True)
+
+    def time_factorial_exact_true_array_positive_int(self):
+        factorial(self.positive_ints, exact=True)
+
+    def time_factorial_exact_true_array_negative_int(self):
+        factorial(self.negative_ints, exact=True)
+
+    def time_factorial_exact_true_array_negative_float(self):
+        factorial(self.negative_floats, exact=True)
+
+
+class Factorial2(Benchmark):
+    def setup(self, *args):
+        self.positive_ints = np.arange(100, 201, step=20, dtype=int)
+        self.negative_ints = -1 * self.positive_ints
+
+    @with_attributes(params=[(100, 200, 400)],
+                     param_names=['n'])
+    def time_factorial2_exact_false_scalar_positive_int(self, n):
+        factorial2(n, exact=False)
+
+    def time_factorial2_exact_false_scalar_negative_int(self):
+        factorial2(-10000, exact=False)
+
+    def time_factorial2_exact_false_array_positive_int(self):
+        factorial2(self.positive_ints, exact=False)
+
+    def time_factorial2_exact_false_array_negative_int(self):
+        factorial2(self.negative_ints, exact=False)
+
+    @with_attributes(params=[(100, 200, 400)],
+                     param_names=['n'])
+    def time_factorial2_exact_true_scalar_positive_int(self, n):
+        factorial2(n, exact=True)
+
+    def time_factorial2_exact_true_scalar_negative_int(self):
+        factorial2(-10000, exact=True)
+
+
+class FactorialK(Benchmark):
+    @with_attributes(params=[(100, 500), range(1, 10)],
+                     param_names=['n', 'k'])
+    def time_factorialk_exact_true_scalar_positive_int(self, n, k):
+        factorialk(n, k, exact=True)
+
+    def time_factorialk_exact_false_scalar_negative_int(self):
+        factorialk(-10000, 3, exact=True)

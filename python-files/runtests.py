@@ -1,791 +1,609 @@
 #!/usr/bin/env python
-import argparse
-import atexit
-import copy
-import gc
-import multiprocessing
-import os
-import shutil
-import socket
-import subprocess
+"""
+runtests.py [OPTIONS] [-- ARGS]
+
+Run tests, building the project first.
+
+Examples::
+
+    $ python runtests.py
+    $ python runtests.py -s {SAMPLE_SUBMODULE}
+    $ python runtests.py -t {SAMPLE_TEST}
+    $ python runtests.py --ipython
+    $ python runtests.py --python somescript.py
+    $ python runtests.py --bench
+    $ python runtests.py --no-build --bench signal.LTI
+
+Run a debugger:
+
+    $ gdb --args python runtests.py [...other args...]
+
+Generate C code coverage listing under build/lcov/:
+(requires http://ltp.sourceforge.net/coverage/lcov.php)
+
+    $ python runtests.py --gcov [...other args...]
+    $ python runtests.py --lcov-html
+
+"""
+
+#
+# This is a generic test runner script for projects using NumPy's test
+# framework. Change the following values to adapt to your project:
+#
+
+PROJECT_MODULE = "scipy"
+PROJECT_ROOT_FILES = ['scipy', 'LICENSE.txt', 'setup.py']
+SAMPLE_TEST = "scipy.fftpack.tests.test_real_transforms::TestIDSTIIIInt"
+SAMPLE_SUBMODULE = "optimize"
+
+EXTRA_PATH = ['/usr/lib/ccache', '/usr/lib/f90cache',
+              '/usr/local/lib/ccache', '/usr/local/lib/f90cache']
+
+
+if __doc__ is None:
+    __doc__ = "Run without -OO if you want usage info"
+else:
+    __doc__ = __doc__.format(**globals())
+
+
+# ---------------------------------------------------------------------
+# ruff: noqa E402
+
 import sys
-import tempfile
-import warnings
-from pathlib import Path
-
-try:
-    import django
-except ImportError as e:
-    raise RuntimeError(
-        "Django module not found, reference tests/README.rst for instructions."
-    ) from e
-else:
-    from django.apps import apps
-    from django.conf import settings
-    from django.core.exceptions import ImproperlyConfigured
-    from django.db import connection, connections
-    from django.test import TestCase, TransactionTestCase
-    from django.test.runner import get_max_test_processes, parallel_type
-    from django.test.selenium import SeleniumTestCaseBase
-    from django.test.utils import NullTimeKeeper, TimeKeeper, get_runner
-    from django.utils.deprecation import (
-        RemovedInDjango51Warning,
-        RemovedInDjango60Warning,
-    )
-    from django.utils.log import DEFAULT_LOGGING
-
-try:
-    import MySQLdb
-except ImportError:
-    pass
-else:
-    # Ignore informational warnings from QuerySet.explain().
-    warnings.filterwarnings("ignore", r"\(1003, *", category=MySQLdb.Warning)
-
-# Make deprecation warnings errors to ensure no usage of deprecated features.
-warnings.simplefilter("error", RemovedInDjango60Warning)
-warnings.simplefilter("error", RemovedInDjango51Warning)
-# Make resource and runtime warning errors to ensure no usage of error prone
-# patterns.
-warnings.simplefilter("error", ResourceWarning)
-warnings.simplefilter("error", RuntimeWarning)
-# Ignore known warnings in test dependencies.
-warnings.filterwarnings(
-    "ignore", "'U' mode is deprecated", DeprecationWarning, module="docutils.io"
-)
-
-# Reduce garbage collection frequency to improve performance. Since CPython
-# uses refcounting, garbage collection only collects objects with cyclic
-# references, which are a minority, so the garbage collection threshold can be
-# larger than the default threshold of 700 allocations + deallocations without
-# much increase in memory usage.
-gc.set_threshold(100_000)
-
-RUNTESTS_DIR = os.path.abspath(os.path.dirname(__file__))
-
-TEMPLATE_DIR = os.path.join(RUNTESTS_DIR, "templates")
-
-# Create a specific subdirectory for the duration of the test suite.
-TMPDIR = tempfile.mkdtemp(prefix="django_")
-# Set the TMPDIR environment variable in addition to tempfile.tempdir
-# so that children processes inherit it.
-tempfile.tempdir = os.environ["TMPDIR"] = TMPDIR
-
-# Removing the temporary TMPDIR.
-atexit.register(shutil.rmtree, TMPDIR)
+import os
+import errno
+# the following multiprocessing import is necessary to prevent tests that use
+# multiprocessing from hanging on >= Python3.8 (macOS) using pytest. Just the
+# import is enough...
+import multiprocessing  # noqa: F401
 
 
-# This is a dict mapping RUNTESTS_DIR subdirectory to subdirectories of that
-# directory to skip when searching for test modules.
-SUBDIRS_TO_SKIP = {
-    "": {"import_error_package", "test_runner_apps"},
-    "gis_tests": {"data"},
-}
+# In case we are run from the source directory, we don't want to import the
+# project from there:
+sys.path.pop(0)
 
-ALWAYS_INSTALLED_APPS = [
-    "django.contrib.contenttypes",
-    "django.contrib.auth",
-    "django.contrib.sites",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.admin.apps.SimpleAdminConfig",
-    "django.contrib.staticfiles",
-]
-
-ALWAYS_MIDDLEWARE = [
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-]
-
-# Need to add the associated contrib app to INSTALLED_APPS in some cases to
-# avoid "RuntimeError: Model class X doesn't declare an explicit app_label
-# and isn't in an application in INSTALLED_APPS."
-CONTRIB_TESTS_TO_APPS = {
-    "deprecation": ["django.contrib.flatpages", "django.contrib.redirects"],
-    "flatpages_tests": ["django.contrib.flatpages"],
-    "redirects_tests": ["django.contrib.redirects"],
-}
+from argparse import ArgumentParser, REMAINDER
+import contextlib
+import shutil
+import subprocess
+import time
+import datetime
+from types import ModuleType as new_module  # noqa: E402
 
 
-def get_test_modules(gis_enabled):
-    """
-    Scan the tests directory and yield the names of all test modules.
-
-    The yielded names have either one dotted part like "test_runner" or, in
-    the case of GIS tests, two dotted parts like "gis_tests.gdal_tests".
-    """
-    discovery_dirs = [""]
-    if gis_enabled:
-        # GIS tests are in nested apps
-        discovery_dirs.append("gis_tests")
-    else:
-        SUBDIRS_TO_SKIP[""].add("gis_tests")
-
-    for dirname in discovery_dirs:
-        dirpath = os.path.join(RUNTESTS_DIR, dirname)
-        subdirs_to_skip = SUBDIRS_TO_SKIP[dirname]
-        with os.scandir(dirpath) as entries:
-            for f in entries:
-                if (
-                    "." in f.name
-                    or os.path.basename(f.name) in subdirs_to_skip
-                    or f.is_file()
-                    or not os.path.exists(os.path.join(f.path, "__init__.py"))
-                ):
-                    continue
-                test_module = f.name
-                if dirname:
-                    test_module = dirname + "." + test_module
-                yield test_module
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 
 
-def get_label_module(label):
-    """Return the top-level module part for a test label."""
-    path = Path(label)
-    if len(path.parts) == 1:
-        # Interpret the label as a dotted module name.
-        return label.split(".")[0]
+def main(argv):
+    parser = ArgumentParser(usage=__doc__.lstrip())
+    parser.add_argument("--verbose", "-v", action="count", default=1,
+                        help="more verbosity")
+    parser.add_argument("--no-build", "-n", action="store_true", default=False,
+                        help="do not build the project (use system installed version)")
+    parser.add_argument("--build-only", "-b", action="store_true", default=False,
+                        help="just build, do not run any tests")
+    parser.add_argument("--doctests", action="store_true", default=False,
+                        help="Run doctests in module")
+    parser.add_argument("--refguide-check", action="store_true", default=False,
+                        help="Run refguide check (do not run regular tests.)")
+    parser.add_argument("--coverage", action="store_true", default=False,
+                        help=("report coverage of project code. HTML output"
+                              " goes under build/coverage"))
+    parser.add_argument("--gcov", action="store_true", default=False,
+                        help=("enable C code coverage via gcov (requires GCC)."
+                              " gcov output goes to build/**/*.gc*"))
+    parser.add_argument("--lcov-html", action="store_true", default=False,
+                        help=("produce HTML for C code coverage information "
+                              "from a previous run with --gcov. "
+                              "HTML output goes to build/lcov/"))
+    parser.add_argument("--mode", "-m", default="fast",
+                        help="'fast', 'full', or something that could be "
+                             "passed to nosetests -A [default: fast]")
+    parser.add_argument("--submodule", "-s", default=None,
+                        help="Submodule whose tests to run (cluster,"
+                             " constants, ...)")
+    parser.add_argument("--pythonpath", "-p", default=None,
+                        help="Paths to prepend to PYTHONPATH")
+    parser.add_argument("--tests", "-t", action='append',
+                        help="Specify tests to run")
+    parser.add_argument("--python", action="store_true",
+                        help="Start a Python shell with PYTHONPATH set")
+    parser.add_argument("--ipython", "-i", action="store_true",
+                        help="Start IPython shell with PYTHONPATH set")
+    parser.add_argument("--shell", action="store_true",
+                        help="Start Unix shell with PYTHONPATH set")
+    parser.add_argument("--debug", "-g", action="store_true",
+                        help="Debug build")
+    parser.add_argument("--parallel", "-j", type=int, default=1,
+                        help="Number of parallel jobs for build and testing")
+    parser.add_argument("--show-build-log", action="store_true",
+                        help="Show build output rather than using a log file")
+    parser.add_argument("--bench", action="store_true",
+                        help="Run benchmark suite instead of test suite")
+    parser.add_argument("--bench-compare", action="append", metavar="BEFORE",
+                        help=("Compare benchmark results of current HEAD to"
+                              " BEFORE. Use an additional "
+                              "--bench-compare=COMMIT to override HEAD with"
+                              " COMMIT. Note that you need to commit your "
+                              "changes first!"
+                              ))
+    parser.add_argument("args", metavar="ARGS", default=[], nargs=REMAINDER,
+                        help="Arguments to pass to Nose, Python or shell")
+    parser.add_argument("--pep8", action="store_true", default=False,
+                        help="Perform pep8 check.")
+    parser.add_argument("--mypy", action="store_true", default=False,
+                        help="Run mypy on the codebase")
+    parser.add_argument("--doc", action="append", nargs="?",
+                        const="html", help="Build documentation")
+    args = parser.parse_args(argv)
 
-    # Otherwise, interpret the label as a path. Check existence first to
-    # provide a better error message than relative_to() if it doesn't exist.
-    if not path.exists():
-        raise RuntimeError(f"Test label path {label} does not exist")
-    path = path.resolve()
-    rel_path = path.relative_to(RUNTESTS_DIR)
-    return rel_path.parts[0]
+    if args.pep8:
+        linter = os.path.join(ROOT_DIR, 'tools', 'lint.py')
+        os.system(linter + " --diff-against=main")
+        sys.exit(0)
 
+    if args.mypy:
+        sys.exit(run_mypy(args))
 
-def get_filtered_test_modules(start_at, start_after, gis_enabled, test_labels=None):
-    if test_labels is None:
-        test_labels = []
-    # Reduce each test label to just the top-level module part.
-    label_modules = set()
-    for label in test_labels:
-        test_module = get_label_module(label)
-        label_modules.add(test_module)
+    if args.bench_compare:
+        args.bench = True
+        args.no_build = True  # ASV does the building
 
-    # It would be nice to put this validation earlier but it must come after
-    # django.setup() so that connection.features.gis_enabled can be accessed.
-    if "gis_tests" in label_modules and not gis_enabled:
-        print("Aborting: A GIS database backend is required to run gis_tests.")
+    if args.lcov_html:
+        # generate C code coverage output
+        lcov_generate()
+        sys.exit(0)
+
+    if args.pythonpath:
+        for p in reversed(args.pythonpath.split(os.pathsep)):
+            sys.path.insert(0, p)
+
+    if args.gcov:
+        gcov_reset_counters()
+
+    if args.debug and args.bench:
+        print("*** Benchmarks should not be run against debug version; "
+              "remove -g flag ***")
+
+    if not args.no_build:
+        site_dir = build_project(args)
+        sys.path.insert(0, site_dir)
+        os.environ['PYTHONPATH'] = \
+            os.pathsep.join((site_dir, os.environ.get('PYTHONPATH', '')))
+
+    extra_argv = args.args[:]
+    if extra_argv and extra_argv[0] == '--':
+        extra_argv = extra_argv[1:]
+
+    if args.python:
+        if extra_argv:
+            # Don't use subprocess, since we don't want to include the
+            # current path in PYTHONPATH.
+            sys.argv = extra_argv
+            with open(extra_argv[0], 'r') as f:
+                script = f.read()
+            sys.modules['__main__'] = new_module('__main__')
+            ns = dict(__name__='__main__',
+                      __file__=extra_argv[0])
+            exec(script, ns)
+            sys.exit(0)
+        else:
+            import code
+            code.interact()
+            sys.exit(0)
+
+    if args.ipython:
+        import IPython
+        IPython.embed(user_ns={})
+        sys.exit(0)
+
+    if args.shell:
+        shell = os.environ.get('SHELL', 'sh')
+        print("Spawning a Unix shell...")
+        os.execv(shell, [shell] + extra_argv)
         sys.exit(1)
 
-    def _module_match_label(module_name, label):
-        # Exact or ancestor match.
-        return module_name == label or module_name.startswith(label + ".")
+    if args.doc:
+        cmd = ["make", "-Cdoc", 'PYTHON="{}"'.format(sys.executable)]
+        cmd += args.doc
+        if args.parallel:
+            cmd.append('SPHINXOPTS="-j{}"'.format(args.parallel))
+        subprocess.run(cmd, check=True)
+        sys.exit(0)
 
-    start_label = start_at or start_after
-    for test_module in get_test_modules(gis_enabled):
-        if start_label:
-            if not _module_match_label(test_module, start_label):
-                continue
-            start_label = ""
-            if not start_at:
-                assert start_after
-                # Skip the current one before starting.
-                continue
-        # If the module (or an ancestor) was named on the command line, or
-        # no modules were named (i.e., run all), include the test module.
-        if not test_labels or any(
-            _module_match_label(test_module, label_module)
-            for label_module in label_modules
-        ):
-            yield test_module
+    if args.coverage:
+        dst_dir = os.path.join(ROOT_DIR, 'build', 'coverage')
+        fn = os.path.join(dst_dir, 'coverage_html.js')
+        if os.path.isdir(dst_dir) and os.path.isfile(fn):
+            shutil.rmtree(dst_dir)
+        extra_argv += ['--cov-report=html:' + dst_dir]
 
+    if args.refguide_check:
+        cmd = [os.path.join(ROOT_DIR, 'tools', 'refguide_check.py'),
+               '--doctests']
+        if args.verbose:
+            cmd += ['-' + 'v'*args.verbose]
+        if args.submodule:
+            cmd += [args.submodule]
+        os.execv(sys.executable, [sys.executable] + cmd)
+        sys.exit(0)
 
-def setup_collect_tests(start_at, start_after, test_labels=None):
-    state = {
-        "INSTALLED_APPS": settings.INSTALLED_APPS,
-        "ROOT_URLCONF": getattr(settings, "ROOT_URLCONF", ""),
-        "TEMPLATES": settings.TEMPLATES,
-        "LANGUAGE_CODE": settings.LANGUAGE_CODE,
-        "STATIC_URL": settings.STATIC_URL,
-        "STATIC_ROOT": settings.STATIC_ROOT,
-        "MIDDLEWARE": settings.MIDDLEWARE,
-    }
+    if args.bench:
+        # Run ASV
+        items = extra_argv
+        if args.tests:
+            items += args.tests
+        if args.submodule:
+            items += [args.submodule]
 
-    # Redirect some settings for the duration of these tests.
-    settings.INSTALLED_APPS = ALWAYS_INSTALLED_APPS
-    settings.ROOT_URLCONF = "urls"
-    settings.STATIC_URL = "static/"
-    settings.STATIC_ROOT = os.path.join(TMPDIR, "static")
-    settings.TEMPLATES = [
-        {
-            "BACKEND": "django.template.backends.django.DjangoTemplates",
-            "DIRS": [TEMPLATE_DIR],
-            "APP_DIRS": True,
-            "OPTIONS": {
-                "context_processors": [
-                    "django.template.context_processors.debug",
-                    "django.template.context_processors.request",
-                    "django.contrib.auth.context_processors.auth",
-                    "django.contrib.messages.context_processors.messages",
-                ],
-            },
-        }
-    ]
-    settings.LANGUAGE_CODE = "en"
-    settings.SITE_ID = 1
-    settings.MIDDLEWARE = ALWAYS_MIDDLEWARE
-    settings.MIGRATION_MODULES = {
-        # This lets us skip creating migrations for the test models as many of
-        # them depend on one of the following contrib applications.
-        "auth": None,
-        "contenttypes": None,
-        "sessions": None,
-    }
-    log_config = copy.deepcopy(DEFAULT_LOGGING)
-    # Filter out non-error logging so we don't have to capture it in lots of
-    # tests.
-    log_config["loggers"]["django"]["level"] = "ERROR"
-    settings.LOGGING = log_config
-    settings.SILENCED_SYSTEM_CHECKS = [
-        "fields.W342",  # ForeignKey(unique=True) -> OneToOneField
-        # django.contrib.postgres.fields.CICharField deprecated.
-        "fields.W905",
-        "postgres.W004",
-        # django.contrib.postgres.fields.CIEmailField deprecated.
-        "fields.W906",
-        # django.contrib.postgres.fields.CITextField deprecated.
-        "fields.W907",
-    ]
+        bench_args = []
+        for a in items:
+            bench_args.extend(['--bench', a])
 
-    # Load all the ALWAYS_INSTALLED_APPS.
-    django.setup()
+        if not args.bench_compare:
+            import scipy
+            print("Running benchmarks for Scipy version %s at %s"
+                  % (scipy.__version__, scipy.__file__))
+            cmd = ['asv', 'run', '--dry-run', '--show-stderr',
+                   '--python=same'] + bench_args
+            retval = run_asv(cmd)
+            sys.exit(retval)
+        else:
+            if len(args.bench_compare) == 1:
+                commit_a = args.bench_compare[0]
+                commit_b = 'HEAD'
+            elif len(args.bench_compare) == 2:
+                commit_a, commit_b = args.bench_compare
+            else:
+                p.error("Too many commits to compare benchmarks for")
 
-    # This flag must be evaluated after django.setup() because otherwise it can
-    # raise AppRegistryNotReady when running gis_tests in isolation on some
-    # backends (e.g. PostGIS).
-    gis_enabled = connection.features.gis_enabled
+            # Check for uncommitted files
+            if commit_b == 'HEAD':
+                r1 = subprocess.call(['git', 'diff-index', '--quiet',
+                                      '--cached', 'HEAD'])
+                r2 = subprocess.call(['git', 'diff-files', '--quiet'])
+                if r1 != 0 or r2 != 0:
+                    print("*"*80)
+                    print("WARNING: you have uncommitted changes --- "
+                          "these will NOT be benchmarked!")
+                    print("*"*80)
 
-    test_modules = list(
-        get_filtered_test_modules(
-            start_at,
-            start_after,
-            gis_enabled,
-            test_labels=test_labels,
-        )
-    )
-    return test_modules, state
+            # Fix commit ids (HEAD is local to current repo)
+            p = subprocess.Popen(['git', 'rev-parse', commit_b],
+                                 stdout=subprocess.PIPE)
+            out, err = p.communicate()
+            commit_b = out.strip()
 
+            p = subprocess.Popen(['git', 'rev-parse', commit_a],
+                                 stdout=subprocess.PIPE)
+            out, err = p.communicate()
+            commit_a = out.strip()
 
-def teardown_collect_tests(state):
-    # Restore the old settings.
-    for key, value in state.items():
-        setattr(settings, key, value)
+            cmd = ['asv', 'continuous', '--show-stderr', '--factor', '1.05',
+                   commit_a, commit_b] + bench_args
+            run_asv(cmd)
+            sys.exit(1)
 
-
-def get_installed():
-    return [app_config.name for app_config in apps.get_app_configs()]
-
-
-# This function should be called only after calling django.setup(),
-# since it calls connection.features.gis_enabled.
-def get_apps_to_install(test_modules):
-    for test_module in test_modules:
-        if test_module in CONTRIB_TESTS_TO_APPS:
-            yield from CONTRIB_TESTS_TO_APPS[test_module]
-        yield test_module
-
-    # Add contrib.gis to INSTALLED_APPS if needed (rather than requiring
-    # @override_settings(INSTALLED_APPS=...) on all test cases.
-    if connection.features.gis_enabled:
-        yield "django.contrib.gis"
-
-
-def setup_run_tests(verbosity, start_at, start_after, test_labels=None):
-    test_modules, state = setup_collect_tests(
-        start_at, start_after, test_labels=test_labels
-    )
-
-    installed_apps = set(get_installed())
-    for app in get_apps_to_install(test_modules):
-        if app in installed_apps:
-            continue
-        if verbosity >= 2:
-            print(f"Importing application {app}")
-        settings.INSTALLED_APPS.append(app)
-        installed_apps.add(app)
-
-    apps.set_installed_apps(settings.INSTALLED_APPS)
-
-    # Force declaring available_apps in TransactionTestCase for faster tests.
-    def no_available_apps(self):
-        raise Exception(
-            "Please define available_apps in TransactionTestCase and its subclasses."
-        )
-
-    TransactionTestCase.available_apps = property(no_available_apps)
-    TestCase.available_apps = None
-
-    # Set an environment variable that other code may consult to see if
-    # Django's own test suite is running.
-    os.environ["RUNNING_DJANGOS_TEST_SUITE"] = "true"
-
-    test_labels = test_labels or test_modules
-    return test_labels, state
-
-
-def teardown_run_tests(state):
-    teardown_collect_tests(state)
-    # Discard the multiprocessing.util finalizer that tries to remove a
-    # temporary directory that's already removed by this script's
-    # atexit.register(shutil.rmtree, TMPDIR) handler. Prevents
-    # FileNotFoundError at the end of a test run (#27890).
-    from multiprocessing.util import _finalizer_registry
-
-    _finalizer_registry.pop((-100, 0), None)
-    del os.environ["RUNNING_DJANGOS_TEST_SUITE"]
-
-
-class ActionSelenium(argparse.Action):
-    """
-    Validate the comma-separated list of requested browsers.
-    """
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        try:
-            import selenium  # NOQA
-        except ImportError as e:
-            raise ImproperlyConfigured(f"Error loading selenium module: {e}")
-        browsers = values.split(",")
-        for browser in browsers:
-            try:
-                SeleniumTestCaseBase.import_webdriver(browser)
-            except ImportError:
-                raise argparse.ArgumentError(
-                    self, "Selenium browser specification '%s' is not valid." % browser
-                )
-        setattr(namespace, self.dest, browsers)
-
-
-def django_tests(
-    verbosity,
-    interactive,
-    failfast,
-    keepdb,
-    reverse,
-    test_labels,
-    debug_sql,
-    parallel,
-    tags,
-    exclude_tags,
-    test_name_patterns,
-    start_at,
-    start_after,
-    pdb,
-    buffer,
-    timing,
-    shuffle,
-):
-    if parallel in {0, "auto"}:
-        max_parallel = get_max_test_processes()
+    if args.build_only:
+        sys.exit(0)
     else:
-        max_parallel = parallel
+        try:
+            test, version, mod_path = import_module()
+        except ImportError:
+            # this may fail when running with --no-build, so try to detect
+            # an installed scipy in a subdir inside a repo
+            dst_dir = os.path.join(ROOT_DIR, 'build', 'testenv')
+            from sysconfig import get_path
+            py_path = get_path('platlib')
+            site_dir = os.path.join(dst_dir, get_path_suffix(py_path, 3))
+            print("Trying to import scipy from development installed path at:",
+                  site_dir)
+            sys.path.insert(0, site_dir)
+            os.environ['PYTHONPATH'] = \
+                os.pathsep.join((site_dir, os.environ.get('PYTHONPATH', '')))
+            test, version, mod_path = import_module()
 
-    if verbosity >= 1:
-        msg = "Testing against Django installed in '%s'" % os.path.dirname(
-            django.__file__
-        )
-        if max_parallel > 1:
-            msg += " with up to %d processes" % max_parallel
-        print(msg)
 
-    process_setup_args = (verbosity, start_at, start_after, test_labels)
-    test_labels, state = setup_run_tests(*process_setup_args)
-    # Run the test suite, including the extra validation tests.
-    if not hasattr(settings, "TEST_RUNNER"):
-        settings.TEST_RUNNER = "django.test.runner.DiscoverRunner"
+    if args.submodule:
+        tests = [PROJECT_MODULE + "." + args.submodule]
+    elif args.tests:
+        tests = args.tests
+    else:
+        tests = None
 
-    if parallel in {0, "auto"}:
-        # This doesn't work before django.setup() on some databases.
-        if all(conn.features.can_clone_databases for conn in connections.all()):
-            parallel = max_parallel
-        else:
-            parallel = 1
+    # Run the tests
 
-    TestRunner = get_runner(settings)
-    TestRunner.parallel_test_suite.process_setup = setup_run_tests
-    TestRunner.parallel_test_suite.process_setup_args = process_setup_args
-    test_runner = TestRunner(
-        verbosity=verbosity,
-        interactive=interactive,
-        failfast=failfast,
-        keepdb=keepdb,
-        reverse=reverse,
-        debug_sql=debug_sql,
-        parallel=parallel,
-        tags=tags,
-        exclude_tags=exclude_tags,
-        test_name_patterns=test_name_patterns,
-        pdb=pdb,
-        buffer=buffer,
-        timing=timing,
-        shuffle=shuffle,
+    if not args.no_build:
+        test_dir = site_dir
+    else:
+        test_dir = os.path.join(ROOT_DIR, 'build', 'test')
+        if not os.path.isdir(test_dir):
+            os.makedirs(test_dir)
+
+    shutil.copyfile(os.path.join(ROOT_DIR, '.coveragerc'),
+                    os.path.join(test_dir, '.coveragerc'))
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(test_dir)
+        print("Running tests for {} version:{}, installed at:{}".format(
+              PROJECT_MODULE, version, mod_path))
+        result = test(args.mode,
+                      verbose=args.verbose,
+                      extra_argv=extra_argv,
+                      doctests=args.doctests,
+                      coverage=args.coverage,
+                      tests=tests,
+                      parallel=args.parallel)
+    finally:
+        os.chdir(cwd)
+
+    if isinstance(result, bool):
+        sys.exit(0 if result else 1)
+    elif result.wasSuccessful():
+        sys.exit(0)
+    else:
+        sys.exit(1)
+
+
+def import_module():
+    """
+    Function of import project module.
+    """
+    __import__(PROJECT_MODULE)
+    test = sys.modules[PROJECT_MODULE].test
+    version = sys.modules[PROJECT_MODULE].__version__
+    mod_path = sys.modules[PROJECT_MODULE].__file__
+    mod_path = os.path.abspath(os.path.join(os.path.dirname(mod_path)))
+    return test, version, mod_path
+
+
+def get_path_suffix(current_path, levels=3):
+    """
+    This utility function is only needed for a single use further down,
+    in order to grab the last `levels` subdirs from the input path.
+    It'll always resolve to something like ``lib/python3.X/site-packages``.
+    Site-packages is actually 3 levels deep on all platforms, so this
+    function should suffice.
+    """
+    current_new = current_path
+    for i in range(levels):
+        current_new = os.path.dirname(current_new)
+
+    return os.path.relpath(current_path, current_new)
+
+
+def build_project(args):
+    """
+    Build a dev version of the project.
+
+    Returns
+    -------
+    site_dir
+        site-packages directory where it was installed
+
+    """
+
+    root_ok = [os.path.exists(os.path.join(ROOT_DIR, fn))
+               for fn in PROJECT_ROOT_FILES]
+    if not all(root_ok):
+        print("To build the project, run runtests.py in "
+              "git checkout or unpacked source")
+        sys.exit(1)
+
+    dst_dir = os.path.join(ROOT_DIR, 'build', 'testenv')
+
+    env = dict(os.environ)
+    cmd = [sys.executable, 'setup.py']
+
+    # Always use ccache, if installed
+    env['PATH'] = os.pathsep.join(EXTRA_PATH +
+                                  env.get('PATH', '').split(os.pathsep))
+
+    if args.debug or args.gcov:
+        # assume everyone uses gcc/gfortran
+        env['OPT'] = '-O0 -ggdb'
+        env['FOPT'] = '-O0 -ggdb'
+        if args.gcov:
+            from sysconfig import get_config_vars
+            cvars = get_config_vars()
+            env['OPT'] = '-O0 -ggdb'
+            env['FOPT'] = '-O0 -ggdb'
+            env['CC'] = env.get('CC', cvars['CC']) + ' --coverage'
+            env['CXX'] = env.get('CXX', cvars['CXX']) + ' --coverage'
+            env['F77'] = 'gfortran --coverage '
+            env['F90'] = 'gfortran --coverage '
+            env['LDSHARED'] = cvars['LDSHARED'] + ' --coverage'
+            env['LDFLAGS'] = " ".join(cvars['LDSHARED'].split()[1:]) +\
+                ' --coverage'
+
+    cmd += ['build']
+    if args.parallel > 1:
+        cmd += ['-j', str(args.parallel)]
+    # Install; avoid producing eggs so SciPy can be imported from dst_dir.
+    cmd += ['install', '--prefix=' + dst_dir,
+            '--single-version-externally-managed',
+            '--record=' + dst_dir + 'tmp_install_log.txt']
+
+    from sysconfig import get_path
+    py_path = get_path('platlib')
+    site_dir = os.path.join(dst_dir, get_path_suffix(py_path, 3))
+
+    # easy_install won't install to a path that Python by default cannot see
+    # and isn't on the PYTHONPATH. Plus, it has to exist.
+    if not os.path.exists(site_dir):
+        os.makedirs(site_dir)
+    env['PYTHONPATH'] = os.pathsep.join((site_dir, env.get('PYTHONPATH', '')))
+
+    log_filename = os.path.join(ROOT_DIR, 'build.log')
+    start_time = datetime.datetime.now()
+
+    if args.show_build_log:
+        ret = subprocess.call(cmd, env=env, cwd=ROOT_DIR)
+    else:
+        log_filename = os.path.join(ROOT_DIR, 'build.log')
+        print("Building, see build.log...")
+        with open(log_filename, 'w') as log:
+            p = subprocess.Popen(cmd, env=env, stdout=log, stderr=log,
+                                 cwd=ROOT_DIR)
+
+        try:
+            # Wait for it to finish, and print something to indicate the
+            # process is alive, but only if the log file has grown (to
+            # allow continuous integration environments kill a hanging
+            # process accurately if it produces no output)
+            last_blip = time.time()
+            last_log_size = os.stat(log_filename).st_size
+            while p.poll() is None:
+                time.sleep(0.5)
+                if time.time() - last_blip > 60:
+                    log_size = os.stat(log_filename).st_size
+                    if log_size > last_log_size:
+                        elapsed = datetime.datetime.now() - start_time
+                        print("    ... build in progress ({0} "
+                              "elapsed)".format(elapsed))
+                        last_blip = time.time()
+                        last_log_size = log_size
+
+            ret = p.wait()
+        except:  # noqa: E722
+            p.terminate()
+            raise
+
+    elapsed = datetime.datetime.now() - start_time
+
+    if ret == 0:
+        print("Build OK ({0} elapsed)".format(elapsed))
+    else:
+        if not args.show_build_log:
+            with open(log_filename, 'r') as f:
+                print(f.read())
+            print("Build failed! ({0} elapsed)".format(elapsed))
+        sys.exit(1)
+
+    return site_dir
+
+
+#
+# GCOV support
+#
+def gcov_reset_counters():
+    print("Removing previous GCOV .gcda files...")
+    build_dir = os.path.join(ROOT_DIR, 'build')
+    for dirpath, dirnames, filenames in os.walk(build_dir):
+        for fn in filenames:
+            if fn.endswith('.gcda') or fn.endswith('.da'):
+                pth = os.path.join(dirpath, fn)
+                os.unlink(pth)
+
+#
+# LCOV support
+#
+
+
+LCOV_OUTPUT_FILE = os.path.join(ROOT_DIR, 'build', 'lcov.out')
+LCOV_HTML_DIR = os.path.join(ROOT_DIR, 'build', 'lcov')
+
+
+def lcov_generate():
+    try:
+        os.unlink(LCOV_OUTPUT_FILE)
+    except OSError:
+        pass
+    try:
+        shutil.rmtree(LCOV_HTML_DIR)
+    except OSError:
+        pass
+
+    print("Capturing lcov info...")
+    subprocess.call(['lcov', '-q', '-c',
+                     '-d', os.path.join(ROOT_DIR, 'build'),
+                     '-b', ROOT_DIR,
+                     '--output-file', LCOV_OUTPUT_FILE])
+
+    print("Generating lcov HTML output...")
+    ret = subprocess.call(['genhtml', '-q', LCOV_OUTPUT_FILE,
+                           '--output-directory', LCOV_HTML_DIR,
+                           '--legend', '--highlight'])
+    if ret != 0:
+        print("genhtml failed!")
+    else:
+        print("HTML output generated under build/lcov/")
+
+
+@contextlib.contextmanager
+def working_dir(new_dir):
+    current_dir = os.getcwd()
+    try:
+        os.chdir(new_dir)
+        yield
+    finally:
+        os.chdir(current_dir)
+
+
+def run_mypy(args):
+    if args.no_build:
+        raise ValueError('Cannot run mypy with --no-build')
+
+    try:
+        import mypy.api
+    except ImportError as e:
+        raise RuntimeError(
+            "Mypy not found. Please install it by running "
+            "pip install -r mypy_requirements.txt from the repo root"
+        ) from e
+
+    site_dir = build_project(args)
+    config = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "mypy.ini",
     )
-    failures = test_runner.run_tests(test_labels)
-    teardown_run_tests(state)
-    return failures
+    with working_dir(site_dir):
+        # By default mypy won't color the output since it isn't being
+        # invoked from a tty.
+        os.environ['MYPY_FORCE_COLOR'] = '1'
+        # Change to the site directory to make sure mypy doesn't pick
+        # up any type stubs in the source tree.
+        report, errors, status = mypy.api.run([
+            "--config-file",
+            config,
+            PROJECT_MODULE,
+        ])
+    print(report, end='')
+    print(errors, end='', file=sys.stderr)
+    return status
 
 
-def collect_test_modules(start_at, start_after):
-    test_modules, state = setup_collect_tests(start_at, start_after)
-    teardown_collect_tests(state)
-    return test_modules
+def run_asv(cmd):
+    cwd = os.path.join(os.path.abspath(os.path.dirname(__file__)),
+                       'benchmarks')
+    # Always use ccache, if installed
+    env = dict(os.environ)
+    env['PATH'] = os.pathsep.join(EXTRA_PATH +
+                                  env.get('PATH', '').split(os.pathsep))
+    # Control BLAS/LAPACK threads
+    env['OPENBLAS_NUM_THREADS'] = '1'
+    env['MKL_NUM_THREADS'] = '1'
 
+    # Limit memory usage
+    sys.path.insert(0, cwd)
+    from benchmarks.common import set_mem_rlimit
+    try:
+        set_mem_rlimit()
+    except (ImportError, RuntimeError):
+        pass
 
-def get_subprocess_args(options):
-    subprocess_args = [sys.executable, __file__, "--settings=%s" % options.settings]
-    if options.failfast:
-        subprocess_args.append("--failfast")
-    if options.verbosity:
-        subprocess_args.append("--verbosity=%s" % options.verbosity)
-    if not options.interactive:
-        subprocess_args.append("--noinput")
-    if options.tags:
-        subprocess_args.append("--tag=%s" % options.tags)
-    if options.exclude_tags:
-        subprocess_args.append("--exclude_tag=%s" % options.exclude_tags)
-    if options.shuffle is not False:
-        if options.shuffle is None:
-            subprocess_args.append("--shuffle")
-        else:
-            subprocess_args.append("--shuffle=%s" % options.shuffle)
-    return subprocess_args
-
-
-def bisect_tests(bisection_label, options, test_labels, start_at, start_after):
-    if not test_labels:
-        test_labels = collect_test_modules(start_at, start_after)
-
-    print("***** Bisecting test suite: %s" % " ".join(test_labels))
-
-    # Make sure the bisection point isn't in the test list
-    # Also remove tests that need to be run in specific combinations
-    for label in [bisection_label, "model_inheritance_same_model_name"]:
-        try:
-            test_labels.remove(label)
-        except ValueError:
-            pass
-
-    subprocess_args = get_subprocess_args(options)
-
-    iteration = 1
-    while len(test_labels) > 1:
-        midpoint = len(test_labels) // 2
-        test_labels_a = test_labels[:midpoint] + [bisection_label]
-        test_labels_b = test_labels[midpoint:] + [bisection_label]
-        print("***** Pass %da: Running the first half of the test suite" % iteration)
-        print("***** Test labels: %s" % " ".join(test_labels_a))
-        failures_a = subprocess.run(subprocess_args + test_labels_a)
-
-        print("***** Pass %db: Running the second half of the test suite" % iteration)
-        print("***** Test labels: %s" % " ".join(test_labels_b))
-        print("")
-        failures_b = subprocess.run(subprocess_args + test_labels_b)
-
-        if failures_a.returncode and not failures_b.returncode:
-            print("***** Problem found in first half. Bisecting again...")
-            iteration += 1
-            test_labels = test_labels_a[:-1]
-        elif failures_b.returncode and not failures_a.returncode:
-            print("***** Problem found in second half. Bisecting again...")
-            iteration += 1
-            test_labels = test_labels_b[:-1]
-        elif failures_a.returncode and failures_b.returncode:
-            print("***** Multiple sources of failure found")
-            break
-        else:
-            print("***** No source of failure found... try pair execution (--pair)")
-            break
-
-    if len(test_labels) == 1:
-        print("***** Source of error: %s" % test_labels[0])
-
-
-def paired_tests(paired_test, options, test_labels, start_at, start_after):
-    if not test_labels:
-        test_labels = collect_test_modules(start_at, start_after)
-
-    print("***** Trying paired execution")
-
-    # Make sure the constant member of the pair isn't in the test list
-    # Also remove tests that need to be run in specific combinations
-    for label in [paired_test, "model_inheritance_same_model_name"]:
-        try:
-            test_labels.remove(label)
-        except ValueError:
-            pass
-
-    subprocess_args = get_subprocess_args(options)
-
-    for i, label in enumerate(test_labels):
-        print(
-            "***** %d of %d: Check test pairing with %s"
-            % (i + 1, len(test_labels), label)
-        )
-        failures = subprocess.call(subprocess_args + [label, paired_test])
-        if failures:
-            print("***** Found problem pair with %s" % label)
-            return
-
-    print("***** No problem pair found")
+    # Run
+    try:
+        return subprocess.call(cmd, env=env, cwd=cwd)
+    except OSError as err:
+        if err.errno == errno.ENOENT:
+            print("Error when running '%s': %s\n" % (" ".join(cmd), str(err),))
+            print("You need to install Airspeed Velocity (https://airspeed-velocity.github.io/asv/)")
+            print("to run Scipy benchmarks")
+            return 1
+        raise
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Django test suite.")
-    parser.add_argument(
-        "modules",
-        nargs="*",
-        metavar="module",
-        help='Optional path(s) to test modules; e.g. "i18n" or '
-        '"i18n.tests.TranslationTests.test_lazy_objects".',
-    )
-    parser.add_argument(
-        "-v",
-        "--verbosity",
-        default=1,
-        type=int,
-        choices=[0, 1, 2, 3],
-        help="Verbosity level; 0=minimal output, 1=normal output, 2=all output",
-    )
-    parser.add_argument(
-        "--noinput",
-        action="store_false",
-        dest="interactive",
-        help="Tells Django to NOT prompt the user for input of any kind.",
-    )
-    parser.add_argument(
-        "--failfast",
-        action="store_true",
-        help="Tells Django to stop running the test suite after first failed test.",
-    )
-    parser.add_argument(
-        "--keepdb",
-        action="store_true",
-        help="Tells Django to preserve the test database between runs.",
-    )
-    parser.add_argument(
-        "--settings",
-        help='Python path to settings module, e.g. "myproject.settings". If '
-        "this isn't provided, either the DJANGO_SETTINGS_MODULE "
-        'environment variable or "test_sqlite" will be used.',
-    )
-    parser.add_argument(
-        "--bisect",
-        help="Bisect the test suite to discover a test that causes a test "
-        "failure when combined with the named test.",
-    )
-    parser.add_argument(
-        "--pair",
-        help="Run the test suite in pairs with the named test to find problem pairs.",
-    )
-    parser.add_argument(
-        "--shuffle",
-        nargs="?",
-        default=False,
-        type=int,
-        metavar="SEED",
-        help=(
-            "Shuffle the order of test cases to help check that tests are "
-            "properly isolated."
-        ),
-    )
-    parser.add_argument(
-        "--reverse",
-        action="store_true",
-        help="Sort test suites and test cases in opposite order to debug "
-        "test side effects not apparent with normal execution lineup.",
-    )
-    parser.add_argument(
-        "--selenium",
-        action=ActionSelenium,
-        metavar="BROWSERS",
-        help="A comma-separated list of browsers to run the Selenium tests against.",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run selenium tests in headless mode, if the browser supports the option.",
-    )
-    parser.add_argument(
-        "--selenium-hub",
-        help="A URL for a selenium hub instance to use in combination with --selenium.",
-    )
-    parser.add_argument(
-        "--external-host",
-        default=socket.gethostname(),
-        help=(
-            "The external host that can be reached by the selenium hub instance when "
-            "running Selenium tests via Selenium Hub."
-        ),
-    )
-    parser.add_argument(
-        "--debug-sql",
-        action="store_true",
-        help="Turn on the SQL query logger within tests.",
-    )
-    # 0 is converted to "auto" or 1 later on, depending on a method used by
-    # multiprocessing to start subprocesses and on the backend support for
-    # cloning databases.
-    parser.add_argument(
-        "--parallel",
-        nargs="?",
-        const="auto",
-        default=0,
-        type=parallel_type,
-        metavar="N",
-        help=(
-            'Run tests using up to N parallel processes. Use the value "auto" '
-            "to run one test process for each processor core."
-        ),
-    )
-    parser.add_argument(
-        "--tag",
-        dest="tags",
-        action="append",
-        help="Run only tests with the specified tags. Can be used multiple times.",
-    )
-    parser.add_argument(
-        "--exclude-tag",
-        dest="exclude_tags",
-        action="append",
-        help="Do not run tests with the specified tag. Can be used multiple times.",
-    )
-    parser.add_argument(
-        "--start-after",
-        dest="start_after",
-        help="Run tests starting after the specified top-level module.",
-    )
-    parser.add_argument(
-        "--start-at",
-        dest="start_at",
-        help="Run tests starting at the specified top-level module.",
-    )
-    parser.add_argument(
-        "--pdb", action="store_true", help="Runs the PDB debugger on error or failure."
-    )
-    parser.add_argument(
-        "-b",
-        "--buffer",
-        action="store_true",
-        help="Discard output of passing tests.",
-    )
-    parser.add_argument(
-        "--timing",
-        action="store_true",
-        help="Output timings, including database set up and total run time.",
-    )
-    parser.add_argument(
-        "-k",
-        dest="test_name_patterns",
-        action="append",
-        help=(
-            "Only run test methods and classes matching test name pattern. "
-            "Same as unittest -k option. Can be used multiple times."
-        ),
-    )
-
-    options = parser.parse_args()
-
-    using_selenium_hub = options.selenium and options.selenium_hub
-    if options.selenium_hub and not options.selenium:
-        parser.error(
-            "--selenium-hub and --external-host require --selenium to be used."
-        )
-    if using_selenium_hub and not options.external_host:
-        parser.error("--selenium-hub and --external-host must be used together.")
-
-    # Allow including a trailing slash on app_labels for tab completion convenience
-    options.modules = [os.path.normpath(labels) for labels in options.modules]
-
-    mutually_exclusive_options = [
-        options.start_at,
-        options.start_after,
-        options.modules,
-    ]
-    enabled_module_options = [
-        bool(option) for option in mutually_exclusive_options
-    ].count(True)
-    if enabled_module_options > 1:
-        print(
-            "Aborting: --start-at, --start-after, and test labels are mutually "
-            "exclusive."
-        )
-        sys.exit(1)
-    for opt_name in ["start_at", "start_after"]:
-        opt_val = getattr(options, opt_name)
-        if opt_val:
-            if "." in opt_val:
-                print(
-                    "Aborting: --%s must be a top-level module."
-                    % opt_name.replace("_", "-")
-                )
-                sys.exit(1)
-            setattr(options, opt_name, os.path.normpath(opt_val))
-    if options.settings:
-        os.environ["DJANGO_SETTINGS_MODULE"] = options.settings
-    else:
-        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_sqlite")
-        options.settings = os.environ["DJANGO_SETTINGS_MODULE"]
-
-    if options.selenium:
-        if multiprocessing.get_start_method() == "spawn" and options.parallel != 1:
-            parser.error(
-                "You cannot use --selenium with parallel tests on this system. "
-                "Pass --parallel=1 to use --selenium."
-            )
-        if not options.tags:
-            options.tags = ["selenium"]
-        elif "selenium" not in options.tags:
-            options.tags.append("selenium")
-        if options.selenium_hub:
-            SeleniumTestCaseBase.selenium_hub = options.selenium_hub
-            SeleniumTestCaseBase.external_host = options.external_host
-        SeleniumTestCaseBase.headless = options.headless
-        SeleniumTestCaseBase.browsers = options.selenium
-
-    if options.bisect:
-        bisect_tests(
-            options.bisect,
-            options,
-            options.modules,
-            options.start_at,
-            options.start_after,
-        )
-    elif options.pair:
-        paired_tests(
-            options.pair,
-            options,
-            options.modules,
-            options.start_at,
-            options.start_after,
-        )
-    else:
-        time_keeper = TimeKeeper() if options.timing else NullTimeKeeper()
-        with time_keeper.timed("Total run"):
-            failures = django_tests(
-                options.verbosity,
-                options.interactive,
-                options.failfast,
-                options.keepdb,
-                options.reverse,
-                options.modules,
-                options.debug_sql,
-                options.parallel,
-                options.tags,
-                options.exclude_tags,
-                getattr(options, "test_name_patterns", None),
-                options.start_at,
-                options.start_after,
-                options.pdb,
-                options.buffer,
-                options.timing,
-                options.shuffle,
-            )
-        time_keeper.print_results()
-        if failures:
-            sys.exit(1)
+    main(argv=sys.argv[1:])

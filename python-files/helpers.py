@@ -1,552 +1,705 @@
-import json
+import os
+import pkgutil
+import socket
+import sys
+import typing as t
+from datetime import datetime
+from functools import lru_cache
+from functools import update_wrapper
+from threading import RLock
 
-from django import forms
-from django.contrib.admin.utils import (
-    display_for_field,
-    flatten_fieldsets,
-    help_text_for_field,
-    label_for_field,
-    lookup_field,
-    quote,
-)
-from django.core.exceptions import ObjectDoesNotExist
-from django.db.models.fields.related import (
-    ForeignObjectRel,
-    ManyToManyRel,
-    OneToOneField,
-)
-from django.forms.utils import flatatt
-from django.template.defaultfilters import capfirst, linebreaksbr
-from django.urls import NoReverseMatch, reverse
-from django.utils.html import conditional_escape, format_html
-from django.utils.safestring import mark_safe
-from django.utils.translation import gettext
-from django.utils.translation import gettext_lazy as _
+import werkzeug.utils
+from werkzeug.exceptions import abort as _wz_abort
+from werkzeug.utils import redirect as _wz_redirect
 
-ACTION_CHECKBOX_NAME = "_selected_action"
+from .globals import _cv_request
+from .globals import current_app
+from .globals import request
+from .globals import request_ctx
+from .globals import session
+from .signals import message_flashed
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    from werkzeug.wrappers import Response as BaseResponse
+    from .wrappers import Response
+    import typing_extensions as te
 
 
-class ActionForm(forms.Form):
-    action = forms.ChoiceField(label=_("Action:"))
-    select_across = forms.BooleanField(
-        label="",
-        required=False,
-        initial=0,
-        widget=forms.HiddenInput({"class": "select-across"}),
+def get_env() -> str:
+    """Get the environment the app is running in, indicated by the
+    :envvar:`FLASK_ENV` environment variable. The default is
+    ``'production'``.
+
+    .. deprecated:: 2.2
+        Will be removed in Flask 2.3.
+    """
+    import warnings
+
+    warnings.warn(
+        "'FLASK_ENV' and 'get_env' are deprecated and will be removed"
+        " in Flask 2.3. Use 'FLASK_DEBUG' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return os.environ.get("FLASK_ENV") or "production"
+
+
+def get_debug_flag() -> bool:
+    """Get whether debug mode should be enabled for the app, indicated by the
+    :envvar:`FLASK_DEBUG` environment variable. The default is ``False``.
+    """
+    val = os.environ.get("FLASK_DEBUG")
+
+    if not val:
+        env = os.environ.get("FLASK_ENV")
+
+        if env is not None:
+            print(
+                "'FLASK_ENV' is deprecated and will not be used in"
+                " Flask 2.3. Use 'FLASK_DEBUG' instead.",
+                file=sys.stderr,
+            )
+            return env == "development"
+
+        return False
+
+    return val.lower() not in {"0", "false", "no"}
+
+
+def get_load_dotenv(default: bool = True) -> bool:
+    """Get whether the user has disabled loading default dotenv files by
+    setting :envvar:`FLASK_SKIP_DOTENV`. The default is ``True``, load
+    the files.
+
+    :param default: What to return if the env var isn't set.
+    """
+    val = os.environ.get("FLASK_SKIP_DOTENV")
+
+    if not val:
+        return default
+
+    return val.lower() in ("0", "false", "no")
+
+
+def stream_with_context(
+    generator_or_function: t.Union[
+        t.Iterator[t.AnyStr], t.Callable[..., t.Iterator[t.AnyStr]]
+    ]
+) -> t.Iterator[t.AnyStr]:
+    """Request contexts disappear when the response is started on the server.
+    This is done for efficiency reasons and to make it less likely to encounter
+    memory leaks with badly written WSGI middlewares.  The downside is that if
+    you are using streamed responses, the generator cannot access request bound
+    information any more.
+
+    This function however can help you keep the context around for longer::
+
+        from flask import stream_with_context, request, Response
+
+        @app.route('/stream')
+        def streamed_response():
+            @stream_with_context
+            def generate():
+                yield 'Hello '
+                yield request.args['name']
+                yield '!'
+            return Response(generate())
+
+    Alternatively it can also be used around a specific generator::
+
+        from flask import stream_with_context, request, Response
+
+        @app.route('/stream')
+        def streamed_response():
+            def generate():
+                yield 'Hello '
+                yield request.args['name']
+                yield '!'
+            return Response(stream_with_context(generate()))
+
+    .. versionadded:: 0.9
+    """
+    try:
+        gen = iter(generator_or_function)  # type: ignore
+    except TypeError:
+
+        def decorator(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            gen = generator_or_function(*args, **kwargs)  # type: ignore
+            return stream_with_context(gen)
+
+        return update_wrapper(decorator, generator_or_function)  # type: ignore
+
+    def generator() -> t.Generator:
+        ctx = _cv_request.get(None)
+        if ctx is None:
+            raise RuntimeError(
+                "'stream_with_context' can only be used when a request"
+                " context is active, such as in a view function."
+            )
+        with ctx:
+            # Dummy sentinel.  Has to be inside the context block or we're
+            # not actually keeping the context around.
+            yield None
+
+            # The try/finally is here so that if someone passes a WSGI level
+            # iterator in we're still running the cleanup logic.  Generators
+            # don't need that because they are closed on their destruction
+            # automatically.
+            try:
+                yield from gen
+            finally:
+                if hasattr(gen, "close"):
+                    gen.close()
+
+    # The trick is to start the generator.  Then the code execution runs until
+    # the first dummy None is yielded at which point the context was already
+    # pushed.  This item is discarded.  Then when the iteration continues the
+    # real generator is executed.
+    wrapped_g = generator()
+    next(wrapped_g)
+    return wrapped_g
+
+
+def make_response(*args: t.Any) -> "Response":
+    """Sometimes it is necessary to set additional headers in a view.  Because
+    views do not have to return response objects but can return a value that
+    is converted into a response object by Flask itself, it becomes tricky to
+    add headers to it.  This function can be called instead of using a return
+    and you will get a response object which you can use to attach headers.
+
+    If view looked like this and you want to add a new header::
+
+        def index():
+            return render_template('index.html', foo=42)
+
+    You can now do something like this::
+
+        def index():
+            response = make_response(render_template('index.html', foo=42))
+            response.headers['X-Parachutes'] = 'parachutes are cool'
+            return response
+
+    This function accepts the very same arguments you can return from a
+    view function.  This for example creates a response with a 404 error
+    code::
+
+        response = make_response(render_template('not_found.html'), 404)
+
+    The other use case of this function is to force the return value of a
+    view function into a response which is helpful with view
+    decorators::
+
+        response = make_response(view_function())
+        response.headers['X-Parachutes'] = 'parachutes are cool'
+
+    Internally this function does the following things:
+
+    -   if no arguments are passed, it creates a new response argument
+    -   if one argument is passed, :meth:`flask.Flask.make_response`
+        is invoked with it.
+    -   if more than one argument is passed, the arguments are passed
+        to the :meth:`flask.Flask.make_response` function as tuple.
+
+    .. versionadded:: 0.6
+    """
+    if not args:
+        return current_app.response_class()
+    if len(args) == 1:
+        args = args[0]
+    return current_app.make_response(args)  # type: ignore
+
+
+def url_for(
+    endpoint: str,
+    *,
+    _anchor: t.Optional[str] = None,
+    _method: t.Optional[str] = None,
+    _scheme: t.Optional[str] = None,
+    _external: t.Optional[bool] = None,
+    **values: t.Any,
+) -> str:
+    """Generate a URL to the given endpoint with the given values.
+
+    This requires an active request or application context, and calls
+    :meth:`current_app.url_for() <flask.Flask.url_for>`. See that method
+    for full documentation.
+
+    :param endpoint: The endpoint name associated with the URL to
+        generate. If this starts with a ``.``, the current blueprint
+        name (if any) will be used.
+    :param _anchor: If given, append this as ``#anchor`` to the URL.
+    :param _method: If given, generate the URL associated with this
+        method for the endpoint.
+    :param _scheme: If given, the URL will have this scheme if it is
+        external.
+    :param _external: If given, prefer the URL to be internal (False) or
+        require it to be external (True). External URLs include the
+        scheme and domain. When not in an active request, URLs are
+        external by default.
+    :param values: Values to use for the variable parts of the URL rule.
+        Unknown keys are appended as query string arguments, like
+        ``?a=b&c=d``.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.url_for``, allowing an app to override the
+        behavior.
+
+    .. versionchanged:: 0.10
+       The ``_scheme`` parameter was added.
+
+    .. versionchanged:: 0.9
+       The ``_anchor`` and ``_method`` parameters were added.
+
+    .. versionchanged:: 0.9
+       Calls ``app.handle_url_build_error`` on build errors.
+    """
+    return current_app.url_for(
+        endpoint,
+        _anchor=_anchor,
+        _method=_method,
+        _scheme=_scheme,
+        _external=_external,
+        **values,
     )
 
 
-class AdminForm:
-    def __init__(
-        self,
-        form,
-        fieldsets,
-        prepopulated_fields,
-        readonly_fields=None,
-        model_admin=None,
-    ):
-        self.form, self.fieldsets = form, fieldsets
-        self.prepopulated_fields = [
-            {"field": form[field_name], "dependencies": [form[f] for f in dependencies]}
-            for field_name, dependencies in prepopulated_fields.items()
-        ]
-        self.model_admin = model_admin
-        if readonly_fields is None:
-            readonly_fields = ()
-        self.readonly_fields = readonly_fields
+def redirect(
+    location: str, code: int = 302, Response: t.Optional[t.Type["BaseResponse"]] = None
+) -> "BaseResponse":
+    """Create a redirect response object.
 
-    def __repr__(self):
-        return (
-            f"<{self.__class__.__qualname__}: "
-            f"form={self.form.__class__.__qualname__} "
-            f"fieldsets={self.fieldsets!r}>"
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`~flask.Flask.redirect` method, otherwise it will use
+    :func:`werkzeug.utils.redirect`.
+
+    :param location: The URL to redirect to.
+    :param code: The status code for the redirect.
+    :param Response: The response class to use. Not used when
+        ``current_app`` is active, which uses ``app.response_class``.
+
+    .. versionadded:: 2.2
+        Calls ``current_app.redirect`` if available instead of always
+        using Werkzeug's default ``redirect``.
+    """
+    if current_app:
+        return current_app.redirect(location, code=code)
+
+    return _wz_redirect(location, code=code, Response=Response)
+
+
+def abort(
+    code: t.Union[int, "BaseResponse"], *args: t.Any, **kwargs: t.Any
+) -> "te.NoReturn":
+    """Raise an :exc:`~werkzeug.exceptions.HTTPException` for the given
+    status code.
+
+    If :data:`~flask.current_app` is available, it will call its
+    :attr:`~flask.Flask.aborter` object, otherwise it will use
+    :func:`werkzeug.exceptions.abort`.
+
+    :param code: The status code for the exception, which must be
+        registered in ``app.aborter``.
+    :param args: Passed to the exception.
+    :param kwargs: Passed to the exception.
+
+    .. versionadded:: 2.2
+        Calls ``current_app.aborter`` if available instead of always
+        using Werkzeug's default ``abort``.
+    """
+    if current_app:
+        current_app.aborter(code, *args, **kwargs)
+
+    _wz_abort(code, *args, **kwargs)
+
+
+def get_template_attribute(template_name: str, attribute: str) -> t.Any:
+    """Loads a macro (or variable) a template exports.  This can be used to
+    invoke a macro from within Python code.  If you for example have a
+    template named :file:`_cider.html` with the following contents:
+
+    .. sourcecode:: html+jinja
+
+       {% macro hello(name) %}Hello {{ name }}!{% endmacro %}
+
+    You can access this from Python code like this::
+
+        hello = get_template_attribute('_cider.html', 'hello')
+        return hello('World')
+
+    .. versionadded:: 0.2
+
+    :param template_name: the name of the template
+    :param attribute: the name of the variable of macro to access
+    """
+    return getattr(current_app.jinja_env.get_template(template_name).module, attribute)
+
+
+def flash(message: str, category: str = "message") -> None:
+    """Flashes a message to the next request.  In order to remove the
+    flashed message from the session and to display it to the user,
+    the template has to call :func:`get_flashed_messages`.
+
+    .. versionchanged:: 0.3
+       `category` parameter added.
+
+    :param message: the message to be flashed.
+    :param category: the category for the message.  The following values
+                     are recommended: ``'message'`` for any kind of message,
+                     ``'error'`` for errors, ``'info'`` for information
+                     messages and ``'warning'`` for warnings.  However any
+                     kind of string can be used as category.
+    """
+    # Original implementation:
+    #
+    #     session.setdefault('_flashes', []).append((category, message))
+    #
+    # This assumed that changes made to mutable structures in the session are
+    # always in sync with the session object, which is not true for session
+    # implementations that use external storage for keeping their keys/values.
+    flashes = session.get("_flashes", [])
+    flashes.append((category, message))
+    session["_flashes"] = flashes
+    message_flashed.send(
+        current_app._get_current_object(),  # type: ignore
+        message=message,
+        category=category,
+    )
+
+
+def get_flashed_messages(
+    with_categories: bool = False, category_filter: t.Iterable[str] = ()
+) -> t.Union[t.List[str], t.List[t.Tuple[str, str]]]:
+    """Pulls all flashed messages from the session and returns them.
+    Further calls in the same request to the function will return
+    the same messages.  By default just the messages are returned,
+    but when `with_categories` is set to ``True``, the return value will
+    be a list of tuples in the form ``(category, message)`` instead.
+
+    Filter the flashed messages to one or more categories by providing those
+    categories in `category_filter`.  This allows rendering categories in
+    separate html blocks.  The `with_categories` and `category_filter`
+    arguments are distinct:
+
+    * `with_categories` controls whether categories are returned with message
+      text (``True`` gives a tuple, where ``False`` gives just the message text).
+    * `category_filter` filters the messages down to only those matching the
+      provided categories.
+
+    See :doc:`/patterns/flashing` for examples.
+
+    .. versionchanged:: 0.3
+       `with_categories` parameter added.
+
+    .. versionchanged:: 0.9
+        `category_filter` parameter added.
+
+    :param with_categories: set to ``True`` to also receive categories.
+    :param category_filter: filter of categories to limit return values.  Only
+                            categories in the list will be returned.
+    """
+    flashes = request_ctx.flashes
+    if flashes is None:
+        flashes = session.pop("_flashes") if "_flashes" in session else []
+        request_ctx.flashes = flashes
+    if category_filter:
+        flashes = list(filter(lambda f: f[0] in category_filter, flashes))
+    if not with_categories:
+        return [x[1] for x in flashes]
+    return flashes
+
+
+def _prepare_send_file_kwargs(**kwargs: t.Any) -> t.Dict[str, t.Any]:
+    if kwargs.get("max_age") is None:
+        kwargs["max_age"] = current_app.get_send_file_max_age
+
+    kwargs.update(
+        environ=request.environ,
+        use_x_sendfile=current_app.config["USE_X_SENDFILE"],
+        response_class=current_app.response_class,
+        _root_path=current_app.root_path,  # type: ignore
+    )
+    return kwargs
+
+
+def send_file(
+    path_or_file: t.Union[os.PathLike, str, t.BinaryIO],
+    mimetype: t.Optional[str] = None,
+    as_attachment: bool = False,
+    download_name: t.Optional[str] = None,
+    conditional: bool = True,
+    etag: t.Union[bool, str] = True,
+    last_modified: t.Optional[t.Union[datetime, int, float]] = None,
+    max_age: t.Optional[
+        t.Union[int, t.Callable[[t.Optional[str]], t.Optional[int]]]
+    ] = None,
+) -> "Response":
+    """Send the contents of a file to the client.
+
+    The first argument can be a file path or a file-like object. Paths
+    are preferred in most cases because Werkzeug can manage the file and
+    get extra information from the path. Passing a file-like object
+    requires that the file is opened in binary mode, and is mostly
+    useful when building a file in memory with :class:`io.BytesIO`.
+
+    Never pass file paths provided by a user. The path is assumed to be
+    trusted, so a user could craft a path to access a file you didn't
+    intend. Use :func:`send_from_directory` to safely serve
+    user-requested paths from within a directory.
+
+    If the WSGI server sets a ``file_wrapper`` in ``environ``, it is
+    used, otherwise Werkzeug's built-in wrapper is used. Alternatively,
+    if the HTTP server supports ``X-Sendfile``, configuring Flask with
+    ``USE_X_SENDFILE = True`` will tell the server to send the given
+    path, which is much more efficient than reading it in Python.
+
+    :param path_or_file: The path to the file to send, relative to the
+        current working directory if a relative path is given.
+        Alternatively, a file-like object opened in binary mode. Make
+        sure the file pointer is seeked to the start of the data.
+    :param mimetype: The MIME type to send for the file. If not
+        provided, it will try to detect it from the file name.
+    :param as_attachment: Indicate to a browser that it should offer to
+        save the file instead of displaying it.
+    :param download_name: The default name browsers will use when saving
+        the file. Defaults to the passed file name.
+    :param conditional: Enable conditional and range responses based on
+        request headers. Requires passing a file path and ``environ``.
+    :param etag: Calculate an ETag for the file, which requires passing
+        a file path. Can also be a string to use instead.
+    :param last_modified: The last modified time to send for the file,
+        in seconds. If not provided, it will try to detect it from the
+        file path.
+    :param max_age: How long the client should cache the file, in
+        seconds. If set, ``Cache-Control`` will be ``public``, otherwise
+        it will be ``no-cache`` to prefer conditional caching.
+
+    .. versionchanged:: 2.0
+        ``download_name`` replaces the ``attachment_filename``
+        parameter. If ``as_attachment=False``, it is passed with
+        ``Content-Disposition: inline`` instead.
+
+    .. versionchanged:: 2.0
+        ``max_age`` replaces the ``cache_timeout`` parameter.
+        ``conditional`` is enabled and ``max_age`` is not set by
+        default.
+
+    .. versionchanged:: 2.0
+        ``etag`` replaces the ``add_etags`` parameter. It can be a
+        string to use instead of generating one.
+
+    .. versionchanged:: 2.0
+        Passing a file-like object that inherits from
+        :class:`~io.TextIOBase` will raise a :exc:`ValueError` rather
+        than sending an empty file.
+
+    .. versionadded:: 2.0
+        Moved the implementation to Werkzeug. This is now a wrapper to
+        pass some Flask-specific arguments.
+
+    .. versionchanged:: 1.1
+        ``filename`` may be a :class:`~os.PathLike` object.
+
+    .. versionchanged:: 1.1
+        Passing a :class:`~io.BytesIO` object supports range requests.
+
+    .. versionchanged:: 1.0.3
+        Filenames are encoded with ASCII instead of Latin-1 for broader
+        compatibility with WSGI servers.
+
+    .. versionchanged:: 1.0
+        UTF-8 filenames as specified in :rfc:`2231` are supported.
+
+    .. versionchanged:: 0.12
+        The filename is no longer automatically inferred from file
+        objects. If you want to use automatic MIME and etag support,
+        pass a filename via ``filename_or_fp`` or
+        ``attachment_filename``.
+
+    .. versionchanged:: 0.12
+        ``attachment_filename`` is preferred over ``filename`` for MIME
+        detection.
+
+    .. versionchanged:: 0.9
+        ``cache_timeout`` defaults to
+        :meth:`Flask.get_send_file_max_age`.
+
+    .. versionchanged:: 0.7
+        MIME guessing and etag support for file-like objects was
+        deprecated because it was unreliable. Pass a filename if you are
+        able to, otherwise attach an etag yourself.
+
+    .. versionchanged:: 0.5
+        The ``add_etags``, ``cache_timeout`` and ``conditional``
+        parameters were added. The default behavior is to add etags.
+
+    .. versionadded:: 0.2
+    """
+    return werkzeug.utils.send_file(  # type: ignore[return-value]
+        **_prepare_send_file_kwargs(
+            path_or_file=path_or_file,
+            environ=request.environ,
+            mimetype=mimetype,
+            as_attachment=as_attachment,
+            download_name=download_name,
+            conditional=conditional,
+            etag=etag,
+            last_modified=last_modified,
+            max_age=max_age,
         )
+    )
 
-    def __iter__(self):
-        for name, options in self.fieldsets:
-            yield Fieldset(
-                self.form,
-                name,
-                readonly_fields=self.readonly_fields,
-                model_admin=self.model_admin,
-                **options,
+
+def send_from_directory(
+    directory: t.Union[os.PathLike, str],
+    path: t.Union[os.PathLike, str],
+    **kwargs: t.Any,
+) -> "Response":
+    """Send a file from within a directory using :func:`send_file`.
+
+    .. code-block:: python
+
+        @app.route("/uploads/<path:name>")
+        def download_file(name):
+            return send_from_directory(
+                app.config['UPLOAD_FOLDER'], name, as_attachment=True
             )
 
-    @property
-    def errors(self):
-        return self.form.errors
+    This is a secure way to serve files from a folder, such as static
+    files or uploads. Uses :func:`~werkzeug.security.safe_join` to
+    ensure the path coming from the client is not maliciously crafted to
+    point outside the specified directory.
 
-    @property
-    def non_field_errors(self):
-        return self.form.non_field_errors
+    If the final path does not point to an existing regular file,
+    raises a 404 :exc:`~werkzeug.exceptions.NotFound` error.
 
-    @property
-    def fields(self):
-        return self.form.fields
+    :param directory: The directory that ``path`` must be located under,
+        relative to the current application's root path.
+    :param path: The path to the file to send, relative to
+        ``directory``.
+    :param kwargs: Arguments to pass to :func:`send_file`.
 
-    @property
-    def is_bound(self):
-        return self.form.is_bound
+    .. versionchanged:: 2.0
+        ``path`` replaces the ``filename`` parameter.
 
-    @property
-    def media(self):
-        media = self.form.media
-        for fs in self:
-            media += fs.media
-        return media
+    .. versionadded:: 2.0
+        Moved the implementation to Werkzeug. This is now a wrapper to
+        pass some Flask-specific arguments.
+
+    .. versionadded:: 0.5
+    """
+    return werkzeug.utils.send_from_directory(  # type: ignore[return-value]
+        directory, path, **_prepare_send_file_kwargs(**kwargs)
+    )
 
 
-class Fieldset:
-    def __init__(
-        self,
-        form,
-        name=None,
-        readonly_fields=(),
-        fields=(),
-        classes=(),
-        description=None,
-        model_admin=None,
-    ):
-        self.form = form
-        self.name, self.fields = name, fields
-        self.classes = " ".join(classes)
-        self.description = description
-        self.model_admin = model_admin
-        self.readonly_fields = readonly_fields
+def get_root_path(import_name: str) -> str:
+    """Find the root path of a package, or the path that contains a
+    module. If it cannot be found, returns the current working
+    directory.
 
-    @property
-    def media(self):
-        if "collapse" in self.classes:
-            return forms.Media(js=["admin/js/collapse.js"])
-        return forms.Media()
+    Not to be confused with the value returned by :func:`find_package`.
 
-    def __iter__(self):
-        for field in self.fields:
-            yield Fieldline(
-                self.form, field, self.readonly_fields, model_admin=self.model_admin
+    :meta private:
+    """
+    # Module already imported and has a file attribute. Use that first.
+    mod = sys.modules.get(import_name)
+
+    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
+        return os.path.dirname(os.path.abspath(mod.__file__))
+
+    # Next attempt: check the loader.
+    loader = pkgutil.get_loader(import_name)
+
+    # Loader does not exist or we're referring to an unloaded main
+    # module or a main module without path (interactive sessions), go
+    # with the current working directory.
+    if loader is None or import_name == "__main__":
+        return os.getcwd()
+
+    if hasattr(loader, "get_filename"):
+        filepath = loader.get_filename(import_name)
+    else:
+        # Fall back to imports.
+        __import__(import_name)
+        mod = sys.modules[import_name]
+        filepath = getattr(mod, "__file__", None)
+
+        # If we don't have a file path it might be because it is a
+        # namespace package. In this case pick the root path from the
+        # first module that is contained in the package.
+        if filepath is None:
+            raise RuntimeError(
+                "No root path can be found for the provided module"
+                f" {import_name!r}. This can happen because the module"
+                " came from an import hook that does not provide file"
+                " name information or because it's a namespace package."
+                " In this case the root path needs to be explicitly"
+                " provided."
             )
 
-
-class Fieldline:
-    def __init__(self, form, field, readonly_fields=None, model_admin=None):
-        self.form = form  # A django.forms.Form instance
-        if not hasattr(field, "__iter__") or isinstance(field, str):
-            self.fields = [field]
-        else:
-            self.fields = field
-        self.has_visible_field = not all(
-            field in self.form.fields and self.form.fields[field].widget.is_hidden
-            for field in self.fields
-        )
-        self.model_admin = model_admin
-        if readonly_fields is None:
-            readonly_fields = ()
-        self.readonly_fields = readonly_fields
-
-    def __iter__(self):
-        for i, field in enumerate(self.fields):
-            if field in self.readonly_fields:
-                yield AdminReadonlyField(
-                    self.form, field, is_first=(i == 0), model_admin=self.model_admin
-                )
-            else:
-                yield AdminField(self.form, field, is_first=(i == 0))
-
-    def errors(self):
-        return mark_safe(
-            "\n".join(
-                self.form[f].errors.as_ul()
-                for f in self.fields
-                if f not in self.readonly_fields
-            ).strip("\n")
-        )
+    # filepath is import_name.py for a module, or __init__.py for a package.
+    return os.path.dirname(os.path.abspath(filepath))
 
 
-class AdminField:
-    def __init__(self, form, field, is_first):
-        self.field = form[field]  # A django.forms.BoundField instance
-        self.is_first = is_first  # Whether this field is first on the line
-        self.is_checkbox = isinstance(self.field.field.widget, forms.CheckboxInput)
-        self.is_readonly = False
+class locked_cached_property(werkzeug.utils.cached_property):
+    """A :func:`property` that is only evaluated once. Like
+    :class:`werkzeug.utils.cached_property` except access uses a lock
+    for thread safety.
 
-    def label_tag(self):
-        classes = []
-        contents = conditional_escape(self.field.label)
-        if self.is_checkbox:
-            classes.append("vCheckboxLabel")
+    .. versionchanged:: 2.0
+        Inherits from Werkzeug's ``cached_property`` (and ``property``).
+    """
 
-        if self.field.field.required:
-            classes.append("required")
-        if not self.is_first:
-            classes.append("inline")
-        attrs = {"class": " ".join(classes)} if classes else {}
-        # checkboxes should not have a label suffix as the checkbox appears
-        # to the left of the label.
-        return self.field.label_tag(
-            contents=mark_safe(contents),
-            attrs=attrs,
-            label_suffix="" if self.is_checkbox else None,
-        )
+    def __init__(
+        self,
+        fget: t.Callable[[t.Any], t.Any],
+        name: t.Optional[str] = None,
+        doc: t.Optional[str] = None,
+    ) -> None:
+        super().__init__(fget, name=name, doc=doc)
+        self.lock = RLock()
 
-    def errors(self):
-        return mark_safe(self.field.errors.as_ul())
+    def __get__(self, obj: object, type: type = None) -> t.Any:  # type: ignore
+        if obj is None:
+            return self
+
+        with self.lock:
+            return super().__get__(obj, type=type)
+
+    def __set__(self, obj: object, value: t.Any) -> None:
+        with self.lock:
+            super().__set__(obj, value)
+
+    def __delete__(self, obj: object) -> None:
+        with self.lock:
+            super().__delete__(obj)
 
 
-class AdminReadonlyField:
-    def __init__(self, form, field, is_first, model_admin=None):
-        # Make self.field look a little bit like a field. This means that
-        # {{ field.name }} must be a useful class name to identify the field.
-        # For convenience, store other field-related data here too.
-        if callable(field):
-            class_name = field.__name__ if field.__name__ != "<lambda>" else ""
-        else:
-            class_name = field
+def is_ip(value: str) -> bool:
+    """Determine if the given string is an IP address.
 
-        if form._meta.labels and class_name in form._meta.labels:
-            label = form._meta.labels[class_name]
-        else:
-            label = label_for_field(field, form._meta.model, model_admin, form=form)
+    :param value: value to check
+    :type value: str
 
-        if form._meta.help_texts and class_name in form._meta.help_texts:
-            help_text = form._meta.help_texts[class_name]
-        else:
-            help_text = help_text_for_field(class_name, form._meta.model)
-
-        if field in form.fields:
-            is_hidden = form.fields[field].widget.is_hidden
-        else:
-            is_hidden = False
-
-        self.field = {
-            "name": class_name,
-            "label": label,
-            "help_text": help_text,
-            "field": field,
-            "is_hidden": is_hidden,
-        }
-        self.form = form
-        self.model_admin = model_admin
-        self.is_first = is_first
-        self.is_checkbox = False
-        self.is_readonly = True
-        self.empty_value_display = model_admin.get_empty_value_display()
-
-    def label_tag(self):
-        attrs = {}
-        if not self.is_first:
-            attrs["class"] = "inline"
-        label = self.field["label"]
-        return format_html(
-            "<label{}>{}{}</label>",
-            flatatt(attrs),
-            capfirst(label),
-            self.form.label_suffix,
-        )
-
-    def get_admin_url(self, remote_field, remote_obj):
-        url_name = "admin:%s_%s_change" % (
-            remote_field.model._meta.app_label,
-            remote_field.model._meta.model_name,
-        )
+    :return: True if string is an IP address
+    :rtype: bool
+    """
+    for family in (socket.AF_INET, socket.AF_INET6):
         try:
-            url = reverse(
-                url_name,
-                args=[quote(remote_obj.pk)],
-                current_app=self.model_admin.admin_site.name,
-            )
-            return format_html('<a href="{}">{}</a>', url, remote_obj)
-        except NoReverseMatch:
-            return str(remote_obj)
-
-    def contents(self):
-        from django.contrib.admin.templatetags.admin_list import _boolean_icon
-
-        field, obj, model_admin = (
-            self.field["field"],
-            self.form.instance,
-            self.model_admin,
-        )
-        try:
-            f, attr, value = lookup_field(field, obj, model_admin)
-        except (AttributeError, ValueError, ObjectDoesNotExist):
-            result_repr = self.empty_value_display
+            socket.inet_pton(family, value)
+        except OSError:
+            pass
         else:
-            if field in self.form.fields:
-                widget = self.form[field].field.widget
-                # This isn't elegant but suffices for contrib.auth's
-                # ReadOnlyPasswordHashWidget.
-                if getattr(widget, "read_only", False):
-                    return widget.render(field, value)
-            if f is None:
-                if getattr(attr, "boolean", False):
-                    result_repr = _boolean_icon(value)
-                else:
-                    if hasattr(value, "__html__"):
-                        result_repr = value
-                    else:
-                        result_repr = linebreaksbr(value)
-            else:
-                if isinstance(f.remote_field, ManyToManyRel) and value is not None:
-                    result_repr = ", ".join(map(str, value.all()))
-                elif (
-                    isinstance(f.remote_field, (ForeignObjectRel, OneToOneField))
-                    and value is not None
-                ):
-                    result_repr = self.get_admin_url(f.remote_field, value)
-                else:
-                    result_repr = display_for_field(value, f, self.empty_value_display)
-                result_repr = linebreaksbr(result_repr)
-        return conditional_escape(result_repr)
+            return True
+
+    return False
 
 
-class InlineAdminFormSet:
-    """
-    A wrapper around an inline formset for use in the admin system.
-    """
+@lru_cache(maxsize=None)
+def _split_blueprint_path(name: str) -> t.List[str]:
+    out: t.List[str] = [name]
 
-    def __init__(
-        self,
-        inline,
-        formset,
-        fieldsets,
-        prepopulated_fields=None,
-        readonly_fields=None,
-        model_admin=None,
-        has_add_permission=True,
-        has_change_permission=True,
-        has_delete_permission=True,
-        has_view_permission=True,
-    ):
-        self.opts = inline
-        self.formset = formset
-        self.fieldsets = fieldsets
-        self.model_admin = model_admin
-        if readonly_fields is None:
-            readonly_fields = ()
-        self.readonly_fields = readonly_fields
-        if prepopulated_fields is None:
-            prepopulated_fields = {}
-        self.prepopulated_fields = prepopulated_fields
-        self.classes = " ".join(inline.classes) if inline.classes else ""
-        self.has_add_permission = has_add_permission
-        self.has_change_permission = has_change_permission
-        self.has_delete_permission = has_delete_permission
-        self.has_view_permission = has_view_permission
+    if "." in name:
+        out.extend(_split_blueprint_path(name.rpartition(".")[0]))
 
-    def __iter__(self):
-        if self.has_change_permission:
-            readonly_fields_for_editing = self.readonly_fields
-        else:
-            readonly_fields_for_editing = self.readonly_fields + flatten_fieldsets(
-                self.fieldsets
-            )
-
-        for form, original in zip(
-            self.formset.initial_forms, self.formset.get_queryset()
-        ):
-            view_on_site_url = self.opts.get_view_on_site_url(original)
-            yield InlineAdminForm(
-                self.formset,
-                form,
-                self.fieldsets,
-                self.prepopulated_fields,
-                original,
-                readonly_fields_for_editing,
-                model_admin=self.opts,
-                view_on_site_url=view_on_site_url,
-            )
-        for form in self.formset.extra_forms:
-            yield InlineAdminForm(
-                self.formset,
-                form,
-                self.fieldsets,
-                self.prepopulated_fields,
-                None,
-                self.readonly_fields,
-                model_admin=self.opts,
-            )
-        if self.has_add_permission:
-            yield InlineAdminForm(
-                self.formset,
-                self.formset.empty_form,
-                self.fieldsets,
-                self.prepopulated_fields,
-                None,
-                self.readonly_fields,
-                model_admin=self.opts,
-            )
-
-    def fields(self):
-        fk = getattr(self.formset, "fk", None)
-        empty_form = self.formset.empty_form
-        meta_labels = empty_form._meta.labels or {}
-        meta_help_texts = empty_form._meta.help_texts or {}
-        for i, field_name in enumerate(flatten_fieldsets(self.fieldsets)):
-            if fk and fk.name == field_name:
-                continue
-            if not self.has_change_permission or field_name in self.readonly_fields:
-                form_field = empty_form.fields.get(field_name)
-                widget_is_hidden = False
-                if form_field is not None:
-                    widget_is_hidden = form_field.widget.is_hidden
-                yield {
-                    "name": field_name,
-                    "label": meta_labels.get(field_name)
-                    or label_for_field(
-                        field_name,
-                        self.opts.model,
-                        self.opts,
-                        form=empty_form,
-                    ),
-                    "widget": {"is_hidden": widget_is_hidden},
-                    "required": False,
-                    "help_text": meta_help_texts.get(field_name)
-                    or help_text_for_field(field_name, self.opts.model),
-                }
-            else:
-                form_field = empty_form.fields[field_name]
-                label = form_field.label
-                if label is None:
-                    label = label_for_field(
-                        field_name, self.opts.model, self.opts, form=empty_form
-                    )
-                yield {
-                    "name": field_name,
-                    "label": label,
-                    "widget": form_field.widget,
-                    "required": form_field.required,
-                    "help_text": form_field.help_text,
-                }
-
-    def inline_formset_data(self):
-        verbose_name = self.opts.verbose_name
-        return json.dumps(
-            {
-                "name": "#%s" % self.formset.prefix,
-                "options": {
-                    "prefix": self.formset.prefix,
-                    "addText": gettext("Add another %(verbose_name)s")
-                    % {
-                        "verbose_name": capfirst(verbose_name),
-                    },
-                    "deleteText": gettext("Remove"),
-                },
-            }
-        )
-
-    @property
-    def forms(self):
-        return self.formset.forms
-
-    def non_form_errors(self):
-        return self.formset.non_form_errors()
-
-    @property
-    def is_bound(self):
-        return self.formset.is_bound
-
-    @property
-    def total_form_count(self):
-        return self.formset.total_form_count
-
-    @property
-    def media(self):
-        media = self.opts.media + self.formset.media
-        for fs in self:
-            media += fs.media
-        return media
-
-
-class InlineAdminForm(AdminForm):
-    """
-    A wrapper around an inline form for use in the admin system.
-    """
-
-    def __init__(
-        self,
-        formset,
-        form,
-        fieldsets,
-        prepopulated_fields,
-        original,
-        readonly_fields=None,
-        model_admin=None,
-        view_on_site_url=None,
-    ):
-        self.formset = formset
-        self.model_admin = model_admin
-        self.original = original
-        self.show_url = original and view_on_site_url is not None
-        self.absolute_url = view_on_site_url
-        super().__init__(
-            form, fieldsets, prepopulated_fields, readonly_fields, model_admin
-        )
-
-    def __iter__(self):
-        for name, options in self.fieldsets:
-            yield InlineFieldset(
-                self.formset,
-                self.form,
-                name,
-                self.readonly_fields,
-                model_admin=self.model_admin,
-                **options,
-            )
-
-    def needs_explicit_pk_field(self):
-        return (
-            # Auto fields are editable, so check for auto or non-editable pk.
-            self.form._meta.model._meta.auto_field
-            or not self.form._meta.model._meta.pk.editable
-            or
-            # Also search any parents for an auto field. (The pk info is
-            # propagated to child models so that does not need to be checked
-            # in parents.)
-            any(
-                parent._meta.auto_field or not parent._meta.model._meta.pk.editable
-                for parent in self.form._meta.model._meta.get_parent_list()
-            )
-        )
-
-    def pk_field(self):
-        return AdminField(self.form, self.formset._pk_field.name, False)
-
-    def fk_field(self):
-        fk = getattr(self.formset, "fk", None)
-        if fk:
-            return AdminField(self.form, fk.name, False)
-        else:
-            return ""
-
-    def deletion_field(self):
-        from django.forms.formsets import DELETION_FIELD_NAME
-
-        return AdminField(self.form, DELETION_FIELD_NAME, False)
-
-
-class InlineFieldset(Fieldset):
-    def __init__(self, formset, *args, **kwargs):
-        self.formset = formset
-        super().__init__(*args, **kwargs)
-
-    def __iter__(self):
-        fk = getattr(self.formset, "fk", None)
-        for field in self.fields:
-            if not fk or fk.name != field:
-                yield Fieldline(
-                    self.form, field, self.readonly_fields, model_admin=self.model_admin
-                )
-
-
-class AdminErrorList(forms.utils.ErrorList):
-    """Store errors for the form/formsets in an add/change view."""
-
-    def __init__(self, form, inline_formsets):
-        super().__init__()
-
-        if form.is_bound:
-            self.extend(form.errors.values())
-            for inline_formset in inline_formsets:
-                self.extend(inline_formset.non_form_errors())
-                for errors_in_inline_form in inline_formset.errors:
-                    self.extend(errors_in_inline_form.values())
+    return out

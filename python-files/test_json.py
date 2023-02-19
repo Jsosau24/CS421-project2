@@ -1,329 +1,365 @@
 import datetime
 import decimal
-import json
-import re
+import io
+import uuid
 
-from django.core import serializers
-from django.core.serializers.base import DeserializationError
-from django.core.serializers.json import DjangoJSONEncoder
-from django.db import models
-from django.test import SimpleTestCase, TestCase, TransactionTestCase
-from django.test.utils import isolate_apps
-from django.utils.translation import gettext_lazy, override
+import pytest
+from werkzeug.http import http_date
 
-from .models import Score
-from .tests import SerializersTestBase, SerializersTransactionTestBase
+import flask
+from flask import json
+from flask.json.provider import DefaultJSONProvider
 
 
-class JsonSerializerTestCase(SerializersTestBase, TestCase):
-    serializer_name = "json"
-    pkless_str = """[
-    {
-        "pk": null,
-        "model": "serializers.category",
-        "fields": {"name": "Reference"}
-    }, {
-        "model": "serializers.category",
-        "fields": {"name": "Non-fiction"}
-    }]"""
-    mapping_ordering_str = """[
-{
-  "model": "serializers.article",
-  "pk": %(article_pk)s,
-  "fields": {
-    "author": %(author_pk)s,
-    "headline": "Poker has no place on ESPN",
-    "pub_date": "2006-06-16T11:00:00",
-    "categories": [
-      %(first_category_pk)s,
-      %(second_category_pk)s
-    ],
-    "meta_data": []
-  }
-}
-]
-"""
+@pytest.mark.parametrize("debug", (True, False))
+def test_bad_request_debug_message(app, client, debug):
+    app.config["DEBUG"] = debug
+    app.config["TRAP_BAD_REQUEST_ERRORS"] = False
 
-    @staticmethod
-    def _validate_output(serial_str):
-        try:
-            json.loads(serial_str)
-        except Exception:
-            return False
-        else:
-            return True
+    @app.route("/json", methods=["POST"])
+    def post_json():
+        flask.request.get_json()
+        return None
 
-    @staticmethod
-    def _get_pk_values(serial_str):
-        serial_list = json.loads(serial_str)
-        return [obj_dict["pk"] for obj_dict in serial_list]
-
-    @staticmethod
-    def _get_field_values(serial_str, field_name):
-        serial_list = json.loads(serial_str)
-        return [
-            obj_dict["fields"][field_name]
-            for obj_dict in serial_list
-            if field_name in obj_dict["fields"]
-        ]
-
-    def test_indentation_whitespace(self):
-        s = serializers.json.Serializer()
-        json_data = s.serialize([Score(score=5.0), Score(score=6.0)], indent=2)
-        for line in json_data.splitlines():
-            if re.search(r".+,\s*$", line):
-                self.assertEqual(line, line.rstrip())
-
-    @isolate_apps("serializers")
-    def test_custom_encoder(self):
-        class ScoreDecimal(models.Model):
-            score = models.DecimalField()
-
-        class CustomJSONEncoder(json.JSONEncoder):
-            def default(self, o):
-                if isinstance(o, decimal.Decimal):
-                    return str(o)
-                return super().default(o)
-
-        s = serializers.json.Serializer()
-        json_data = s.serialize(
-            [ScoreDecimal(score=decimal.Decimal(1.0))], cls=CustomJSONEncoder
-        )
-        self.assertIn('"fields": {"score": "1"}', json_data)
-
-    def test_json_deserializer_exception(self):
-        with self.assertRaises(DeserializationError):
-            for obj in serializers.deserialize("json", """[{"pk":1}"""):
-                pass
-
-    def test_helpful_error_message_invalid_pk(self):
-        """
-        If there is an invalid primary key, the error message should contain
-        the model associated with it.
-        """
-        test_string = """[{
-            "pk": "badpk",
-            "model": "serializers.player",
-            "fields": {
-                "name": "Bob",
-                "rank": 1,
-                "team": "Team"
-            }
-        }]"""
-        with self.assertRaisesMessage(
-            DeserializationError, "(serializers.player:pk=badpk)"
-        ):
-            list(serializers.deserialize("json", test_string))
-
-    def test_helpful_error_message_invalid_field(self):
-        """
-        If there is an invalid field value, the error message should contain
-        the model associated with it.
-        """
-        test_string = """[{
-            "pk": "1",
-            "model": "serializers.player",
-            "fields": {
-                "name": "Bob",
-                "rank": "invalidint",
-                "team": "Team"
-            }
-        }]"""
-        expected = "(serializers.player:pk=1) field_value was 'invalidint'"
-        with self.assertRaisesMessage(DeserializationError, expected):
-            list(serializers.deserialize("json", test_string))
-
-    def test_helpful_error_message_for_foreign_keys(self):
-        """
-        Invalid foreign keys with a natural key should throw a helpful error
-        message, such as what the failing key is.
-        """
-        test_string = """[{
-            "pk": 1,
-            "model": "serializers.category",
-            "fields": {
-                "name": "Unknown foreign key",
-                "meta_data": [
-                    "doesnotexist",
-                    "metadata"
-                ]
-            }
-        }]"""
-        key = ["doesnotexist", "metadata"]
-        expected = "(serializers.category:pk=1) field_value was '%r'" % key
-        with self.assertRaisesMessage(DeserializationError, expected):
-            list(serializers.deserialize("json", test_string))
-
-    def test_helpful_error_message_for_many2many_non_natural(self):
-        """
-        Invalid many-to-many keys should throw a helpful error message.
-        """
-        test_string = """[{
-            "pk": 1,
-            "model": "serializers.article",
-            "fields": {
-                "author": 1,
-                "headline": "Unknown many to many",
-                "pub_date": "2014-09-15T10:35:00",
-                "categories": [1, "doesnotexist"]
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.author",
-            "fields": {
-                "name": "Agnes"
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.category",
-            "fields": {
-                "name": "Reference"
-            }
-        }]"""
-        expected = "(serializers.article:pk=1) field_value was 'doesnotexist'"
-        with self.assertRaisesMessage(DeserializationError, expected):
-            list(serializers.deserialize("json", test_string))
-
-    def test_helpful_error_message_for_many2many_natural1(self):
-        """
-        Invalid many-to-many keys should throw a helpful error message.
-        This tests the code path where one of a list of natural keys is invalid.
-        """
-        test_string = """[{
-            "pk": 1,
-            "model": "serializers.categorymetadata",
-            "fields": {
-                "kind": "author",
-                "name": "meta1",
-                "value": "Agnes"
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.article",
-            "fields": {
-                "author": 1,
-                "headline": "Unknown many to many",
-                "pub_date": "2014-09-15T10:35:00",
-                "meta_data": [
-                    ["author", "meta1"],
-                    ["doesnotexist", "meta1"],
-                    ["author", "meta1"]
-                ]
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.author",
-            "fields": {
-                "name": "Agnes"
-            }
-        }]"""
-        key = ["doesnotexist", "meta1"]
-        expected = "(serializers.article:pk=1) field_value was '%r'" % key
-        with self.assertRaisesMessage(DeserializationError, expected):
-            for obj in serializers.deserialize("json", test_string):
-                obj.save()
-
-    def test_helpful_error_message_for_many2many_natural2(self):
-        """
-        Invalid many-to-many keys should throw a helpful error message. This
-        tests the code path where a natural many-to-many key has only a single
-        value.
-        """
-        test_string = """[{
-            "pk": 1,
-            "model": "serializers.article",
-            "fields": {
-                "author": 1,
-                "headline": "Unknown many to many",
-                "pub_date": "2014-09-15T10:35:00",
-                "meta_data": [1, "doesnotexist"]
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.categorymetadata",
-            "fields": {
-                "kind": "author",
-                "name": "meta1",
-                "value": "Agnes"
-            }
-        }, {
-            "pk": 1,
-            "model": "serializers.author",
-            "fields": {
-                "name": "Agnes"
-            }
-        }]"""
-        expected = "(serializers.article:pk=1) field_value was 'doesnotexist'"
-        with self.assertRaisesMessage(DeserializationError, expected):
-            for obj in serializers.deserialize("json", test_string, ignore=False):
-                obj.save()
-
-    def test_helpful_error_message_for_many2many_not_iterable(self):
-        """
-        Not iterable many-to-many field value throws a helpful error message.
-        """
-        test_string = """[{
-            "pk": 1,
-            "model": "serializers.m2mdata",
-            "fields": {"data": null}
-        }]"""
-
-        expected = "(serializers.m2mdata:pk=1) field_value was 'None'"
-        with self.assertRaisesMessage(DeserializationError, expected):
-            next(serializers.deserialize("json", test_string, ignore=False))
+    rv = client.post("/json", data=None, content_type="application/json")
+    assert rv.status_code == 400
+    contains = b"Failed to decode JSON object" in rv.data
+    assert contains == debug
 
 
-class JsonSerializerTransactionTestCase(
-    SerializersTransactionTestBase, TransactionTestCase
-):
-    serializer_name = "json"
-    fwd_ref_str = """[
-    {
-        "pk": 1,
-        "model": "serializers.article",
-        "fields": {
-            "headline": "Forward references pose no problem",
-            "pub_date": "2006-06-16T15:00:00",
-            "categories": [1],
-            "author": 1
-        }
-    },
-    {
-        "pk": 1,
-        "model": "serializers.category",
-        "fields": {
-            "name": "Reference"
-        }
-    },
-    {
-        "pk": 1,
-        "model": "serializers.author",
-        "fields": {
-            "name": "Agnes"
-        }
-    }]"""
+def test_json_bad_requests(app, client):
+    @app.route("/json", methods=["POST"])
+    def return_json():
+        return flask.jsonify(foo=str(flask.request.get_json()))
+
+    rv = client.post("/json", data="malformed", content_type="application/json")
+    assert rv.status_code == 400
 
 
-class DjangoJSONEncoderTests(SimpleTestCase):
-    def test_lazy_string_encoding(self):
-        self.assertEqual(
-            json.dumps({"lang": gettext_lazy("French")}, cls=DjangoJSONEncoder),
-            '{"lang": "French"}',
-        )
-        with override("fr"):
-            self.assertEqual(
-                json.dumps({"lang": gettext_lazy("French")}, cls=DjangoJSONEncoder),
-                '{"lang": "Fran\\u00e7ais"}',
-            )
+def test_json_custom_mimetypes(app, client):
+    @app.route("/json", methods=["POST"])
+    def return_json():
+        return flask.request.get_json()
 
-    def test_timedelta(self):
-        duration = datetime.timedelta(days=1, hours=2, seconds=3)
-        self.assertEqual(
-            json.dumps({"duration": duration}, cls=DjangoJSONEncoder),
-            '{"duration": "P1DT02H00M03S"}',
-        )
-        duration = datetime.timedelta(0)
-        self.assertEqual(
-            json.dumps({"duration": duration}, cls=DjangoJSONEncoder),
-            '{"duration": "P0DT00H00M00S"}',
-        )
+    rv = client.post("/json", data='"foo"', content_type="application/x+json")
+    assert rv.data == b"foo"
+
+
+@pytest.mark.parametrize(
+    "test_value,expected", [(True, '"\\u2603"'), (False, '"\u2603"')]
+)
+def test_json_as_unicode(test_value, expected, app, app_ctx):
+    app.json.ensure_ascii = test_value
+    rv = app.json.dumps("\N{SNOWMAN}")
+    assert rv == expected
+
+
+def test_json_dump_to_file(app, app_ctx):
+    test_data = {"name": "Flask"}
+    out = io.StringIO()
+
+    flask.json.dump(test_data, out)
+    out.seek(0)
+    rv = flask.json.load(out)
+    assert rv == test_data
+
+
+@pytest.mark.parametrize(
+    "test_value", [0, -1, 1, 23, 3.14, "s", "longer string", True, False, None]
+)
+def test_jsonify_basic_types(test_value, app, client):
+    url = "/jsonify_basic_types"
+    app.add_url_rule(url, url, lambda x=test_value: flask.jsonify(x))
+    rv = client.get(url)
+    assert rv.mimetype == "application/json"
+    assert flask.json.loads(rv.data) == test_value
+
+
+def test_jsonify_dicts(app, client):
+    d = {
+        "a": 0,
+        "b": 23,
+        "c": 3.14,
+        "d": "t",
+        "e": "Hi",
+        "f": True,
+        "g": False,
+        "h": ["test list", 10, False],
+        "i": {"test": "dict"},
+    }
+
+    @app.route("/kw")
+    def return_kwargs():
+        return flask.jsonify(**d)
+
+    @app.route("/dict")
+    def return_dict():
+        return flask.jsonify(d)
+
+    for url in "/kw", "/dict":
+        rv = client.get(url)
+        assert rv.mimetype == "application/json"
+        assert flask.json.loads(rv.data) == d
+
+
+def test_jsonify_arrays(app, client):
+    """Test jsonify of lists and args unpacking."""
+    a_list = [
+        0,
+        42,
+        3.14,
+        "t",
+        "hello",
+        True,
+        False,
+        ["test list", 2, False],
+        {"test": "dict"},
+    ]
+
+    @app.route("/args_unpack")
+    def return_args_unpack():
+        return flask.jsonify(*a_list)
+
+    @app.route("/array")
+    def return_array():
+        return flask.jsonify(a_list)
+
+    for url in "/args_unpack", "/array":
+        rv = client.get(url)
+        assert rv.mimetype == "application/json"
+        assert flask.json.loads(rv.data) == a_list
+
+
+@pytest.mark.parametrize(
+    "value", [datetime.datetime(1973, 3, 11, 6, 30, 45), datetime.date(1975, 1, 5)]
+)
+def test_jsonify_datetime(app, client, value):
+    @app.route("/")
+    def index():
+        return flask.jsonify(value=value)
+
+    r = client.get()
+    assert r.json["value"] == http_date(value)
+
+
+class FixedOffset(datetime.tzinfo):
+    """Fixed offset in hours east from UTC.
+
+    This is a slight adaptation of the ``FixedOffset`` example found in
+    https://docs.python.org/2.7/library/datetime.html.
+    """
+
+    def __init__(self, hours, name):
+        self.__offset = datetime.timedelta(hours=hours)
+        self.__name = name
+
+    def utcoffset(self, dt):
+        return self.__offset
+
+    def tzname(self, dt):
+        return self.__name
+
+    def dst(self, dt):
+        return datetime.timedelta()
+
+
+@pytest.mark.parametrize("tz", (("UTC", 0), ("PST", -8), ("KST", 9)))
+def test_jsonify_aware_datetimes(tz):
+    """Test if aware datetime.datetime objects are converted into GMT."""
+    tzinfo = FixedOffset(hours=tz[1], name=tz[0])
+    dt = datetime.datetime(2017, 1, 1, 12, 34, 56, tzinfo=tzinfo)
+    gmt = FixedOffset(hours=0, name="GMT")
+    expected = dt.astimezone(gmt).strftime('"%a, %d %b %Y %H:%M:%S %Z"')
+    assert flask.json.dumps(dt) == expected
+
+
+def test_jsonify_uuid_types(app, client):
+    """Test jsonify with uuid.UUID types"""
+
+    test_uuid = uuid.UUID(bytes=b"\xDE\xAD\xBE\xEF" * 4)
+    url = "/uuid_test"
+    app.add_url_rule(url, url, lambda: flask.jsonify(x=test_uuid))
+
+    rv = client.get(url)
+
+    rv_x = flask.json.loads(rv.data)["x"]
+    assert rv_x == str(test_uuid)
+    rv_uuid = uuid.UUID(rv_x)
+    assert rv_uuid == test_uuid
+
+
+def test_json_decimal():
+    rv = flask.json.dumps(decimal.Decimal("0.003"))
+    assert rv == '"0.003"'
+
+
+def test_json_attr(app, client):
+    @app.route("/add", methods=["POST"])
+    def add():
+        json = flask.request.get_json()
+        return str(json["a"] + json["b"])
+
+    rv = client.post(
+        "/add",
+        data=flask.json.dumps({"a": 1, "b": 2}),
+        content_type="application/json",
+    )
+    assert rv.data == b"3"
+
+
+def test_tojson_filter(app, req_ctx):
+    # The tojson filter is tested in Jinja, this confirms that it's
+    # using Flask's dumps.
+    rv = flask.render_template_string(
+        "const data = {{ data|tojson }};",
+        data={"name": "</script>", "time": datetime.datetime(2021, 2, 1, 7, 15)},
+    )
+    assert rv == (
+        'const data = {"name": "\\u003c/script\\u003e",'
+        ' "time": "Mon, 01 Feb 2021 07:15:00 GMT"};'
+    )
+
+
+def test_json_customization(app, client):
+    class X:  # noqa: B903, for Python2 compatibility
+        def __init__(self, val):
+            self.val = val
+
+    def default(o):
+        if isinstance(o, X):
+            return f"<{o.val}>"
+
+        return DefaultJSONProvider.default(o)
+
+    class CustomProvider(DefaultJSONProvider):
+        def object_hook(self, obj):
+            if len(obj) == 1 and "_foo" in obj:
+                return X(obj["_foo"])
+
+            return obj
+
+        def loads(self, s, **kwargs):
+            kwargs.setdefault("object_hook", self.object_hook)
+            return super().loads(s, **kwargs)
+
+    app.json = CustomProvider(app)
+    app.json.default = default
+
+    @app.route("/", methods=["POST"])
+    def index():
+        return flask.json.dumps(flask.request.get_json()["x"])
+
+    rv = client.post(
+        "/",
+        data=flask.json.dumps({"x": {"_foo": 42}}),
+        content_type="application/json",
+    )
+    assert rv.data == b'"<42>"'
+
+
+def _has_encoding(name):
+    try:
+        import codecs
+
+        codecs.lookup(name)
+        return True
+    except LookupError:
+        return False
+
+
+@pytest.mark.skipif(
+    not _has_encoding("euc-kr"), reason="The euc-kr encoding is required."
+)
+def test_modified_url_encoding(app, client):
+    class ModifiedRequest(flask.Request):
+        url_charset = "euc-kr"
+
+    app.request_class = ModifiedRequest
+    app.url_map.charset = "euc-kr"
+
+    @app.route("/")
+    def index():
+        return flask.request.args["foo"]
+
+    rv = client.get("/", query_string={"foo": "정상처리"}, charset="euc-kr")
+    assert rv.status_code == 200
+    assert rv.get_data(as_text=True) == "정상처리"
+
+
+def test_json_key_sorting(app, client):
+    app.debug = True
+    assert app.json.sort_keys
+    d = dict.fromkeys(range(20), "foo")
+
+    @app.route("/")
+    def index():
+        return flask.jsonify(values=d)
+
+    rv = client.get("/")
+    lines = [x.strip() for x in rv.data.strip().decode("utf-8").splitlines()]
+    sorted_by_str = [
+        "{",
+        '"values": {',
+        '"0": "foo",',
+        '"1": "foo",',
+        '"10": "foo",',
+        '"11": "foo",',
+        '"12": "foo",',
+        '"13": "foo",',
+        '"14": "foo",',
+        '"15": "foo",',
+        '"16": "foo",',
+        '"17": "foo",',
+        '"18": "foo",',
+        '"19": "foo",',
+        '"2": "foo",',
+        '"3": "foo",',
+        '"4": "foo",',
+        '"5": "foo",',
+        '"6": "foo",',
+        '"7": "foo",',
+        '"8": "foo",',
+        '"9": "foo"',
+        "}",
+        "}",
+    ]
+    sorted_by_int = [
+        "{",
+        '"values": {',
+        '"0": "foo",',
+        '"1": "foo",',
+        '"2": "foo",',
+        '"3": "foo",',
+        '"4": "foo",',
+        '"5": "foo",',
+        '"6": "foo",',
+        '"7": "foo",',
+        '"8": "foo",',
+        '"9": "foo",',
+        '"10": "foo",',
+        '"11": "foo",',
+        '"12": "foo",',
+        '"13": "foo",',
+        '"14": "foo",',
+        '"15": "foo",',
+        '"16": "foo",',
+        '"17": "foo",',
+        '"18": "foo",',
+        '"19": "foo"',
+        "}",
+        "}",
+    ]
+
+    try:
+        assert lines == sorted_by_int
+    except AssertionError:
+        assert lines == sorted_by_str
+
+
+def test_html_method():
+    class ObjectWithHTML:
+        def __html__(self):
+            return "<p>test</p>"
+
+    result = json.dumps(ObjectWithHTML())
+    assert result == '"<p>test</p>"'

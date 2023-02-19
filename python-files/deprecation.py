@@ -1,156 +1,115 @@
-import inspect
 import warnings
-
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
-
-
-class RemovedInDjango51Warning(DeprecationWarning):
-    pass
+import functools
 
 
-class RemovedInDjango60Warning(PendingDeprecationWarning):
-    pass
+__all__ = ["deprecated"]
 
 
-RemovedInNextVersionWarning = RemovedInDjango51Warning
-RemovedAfterNextVersionWarning = RemovedInDjango60Warning
+class deprecated:
+    """Decorator to mark a function or class as deprecated.
 
+    Issue a warning when the function is called/the class is instantiated and
+    adds a warning to the docstring.
 
-class warn_about_renamed_method:
-    def __init__(
-        self, class_name, old_method_name, new_method_name, deprecation_warning
-    ):
-        self.class_name = class_name
-        self.old_method_name = old_method_name
-        self.new_method_name = new_method_name
-        self.deprecation_warning = deprecation_warning
+    The optional extra argument will be appended to the deprecation message
+    and the docstring. Note: to use this with the default value for extra, put
+    in an empty of parentheses:
 
-    def __call__(self, f):
-        def wrapper(*args, **kwargs):
-            warnings.warn(
-                "`%s.%s` is deprecated, use `%s` instead."
-                % (self.class_name, self.old_method_name, self.new_method_name),
-                self.deprecation_warning,
-                2,
-            )
-            return f(*args, **kwargs)
+    >>> from sklearn.utils import deprecated
+    >>> deprecated()
+    <sklearn.utils.deprecation.deprecated object at ...>
 
-        return wrapper
+    >>> @deprecated()
+    ... def some_function(): pass
 
-
-class RenameMethodsBase(type):
-    """
-    Handles the deprecation paths when renaming a method.
-
-    It does the following:
-        1) Define the new method if missing and complain about it.
-        2) Define the old method if missing.
-        3) Complain whenever an old method is called.
-
-    See #15363 for more details.
+    Parameters
+    ----------
+    extra : str, default=''
+          To be added to the deprecation messages.
     """
 
-    renamed_methods = ()
+    # Adapted from https://wiki.python.org/moin/PythonDecoratorLibrary,
+    # but with many changes.
 
-    def __new__(cls, name, bases, attrs):
-        new_class = super().__new__(cls, name, bases, attrs)
+    def __init__(self, extra=""):
+        self.extra = extra
 
-        for base in inspect.getmro(new_class):
-            class_name = base.__name__
-            for renamed_method in cls.renamed_methods:
-                old_method_name = renamed_method[0]
-                old_method = base.__dict__.get(old_method_name)
-                new_method_name = renamed_method[1]
-                new_method = base.__dict__.get(new_method_name)
-                deprecation_warning = renamed_method[2]
-                wrapper = warn_about_renamed_method(class_name, *renamed_method)
+    def __call__(self, obj):
+        """Call method
 
-                # Define the new method if missing and complain about it
-                if not new_method and old_method:
-                    warnings.warn(
-                        "`%s.%s` method should be renamed `%s`."
-                        % (class_name, old_method_name, new_method_name),
-                        deprecation_warning,
-                        2,
-                    )
-                    setattr(base, new_method_name, old_method)
-                    setattr(base, old_method_name, wrapper(old_method))
-
-                # Define the old method as a wrapped call to the new method.
-                if not old_method and new_method:
-                    setattr(base, old_method_name, wrapper(new_method))
-
-        return new_class
-
-
-class DeprecationInstanceCheck(type):
-    def __instancecheck__(self, instance):
-        warnings.warn(
-            "`%s` is deprecated, use `%s` instead." % (self.__name__, self.alternative),
-            self.deprecation_warning,
-            2,
-        )
-        return super().__instancecheck__(instance)
-
-
-class MiddlewareMixin:
-    sync_capable = True
-    async_capable = True
-
-    def __init__(self, get_response):
-        if get_response is None:
-            raise ValueError("get_response must be provided.")
-        self.get_response = get_response
-        self._async_check()
-        super().__init__()
-
-    def __repr__(self):
-        return "<%s get_response=%s>" % (
-            self.__class__.__qualname__,
-            getattr(
-                self.get_response,
-                "__qualname__",
-                self.get_response.__class__.__name__,
-            ),
-        )
-
-    def _async_check(self):
+        Parameters
+        ----------
+        obj : object
         """
-        If get_response is a coroutine function, turns us into async mode so
-        a thread is not consumed during a whole request.
-        """
-        if iscoroutinefunction(self.get_response):
-            # Mark the class as async-capable, but do the actual switch
-            # inside __call__ to avoid swapping out dunder methods
-            markcoroutinefunction(self)
+        if isinstance(obj, type):
+            return self._decorate_class(obj)
+        elif isinstance(obj, property):
+            # Note that this is only triggered properly if the `property`
+            # decorator comes before the `deprecated` decorator, like so:
+            #
+            # @deprecated(msg)
+            # @property
+            # def deprecated_attribute_(self):
+            #     ...
+            return self._decorate_property(obj)
+        else:
+            return self._decorate_fun(obj)
 
-    def __call__(self, request):
-        # Exit out to async mode, if needed
-        if iscoroutinefunction(self):
-            return self.__acall__(request)
-        response = None
-        if hasattr(self, "process_request"):
-            response = self.process_request(request)
-        response = response or self.get_response(request)
-        if hasattr(self, "process_response"):
-            response = self.process_response(request, response)
-        return response
+    def _decorate_class(self, cls):
+        msg = "Class %s is deprecated" % cls.__name__
+        if self.extra:
+            msg += "; %s" % self.extra
 
-    async def __acall__(self, request):
-        """
-        Async version of __call__ that is swapped in when an async request
-        is running.
-        """
-        response = None
-        if hasattr(self, "process_request"):
-            response = await sync_to_async(
-                self.process_request,
-                thread_sensitive=True,
-            )(request)
-        response = response or await self.get_response(request)
-        if hasattr(self, "process_response"):
-            response = await sync_to_async(
-                self.process_response,
-                thread_sensitive=True,
-            )(request, response)
-        return response
+        # FIXME: we should probably reset __new__ for full generality
+        init = cls.__init__
+
+        def wrapped(*args, **kwargs):
+            warnings.warn(msg, category=FutureWarning)
+            return init(*args, **kwargs)
+
+        cls.__init__ = wrapped
+
+        wrapped.__name__ = "__init__"
+        wrapped.deprecated_original = init
+
+        return cls
+
+    def _decorate_fun(self, fun):
+        """Decorate function fun"""
+
+        msg = "Function %s is deprecated" % fun.__name__
+        if self.extra:
+            msg += "; %s" % self.extra
+
+        @functools.wraps(fun)
+        def wrapped(*args, **kwargs):
+            warnings.warn(msg, category=FutureWarning)
+            return fun(*args, **kwargs)
+
+        # Add a reference to the wrapped function so that we can introspect
+        # on function arguments in Python 2 (already works in Python 3)
+        wrapped.__wrapped__ = fun
+
+        return wrapped
+
+    def _decorate_property(self, prop):
+        msg = self.extra
+
+        @property
+        @functools.wraps(prop)
+        def wrapped(*args, **kwargs):
+            warnings.warn(msg, category=FutureWarning)
+            return prop.fget(*args, **kwargs)
+
+        return wrapped
+
+
+def _is_deprecated(func):
+    """Helper to check if func is wrapped by our deprecated decorator"""
+    closures = getattr(func, "__closure__", [])
+    if closures is None:
+        closures = []
+    is_deprecated = "deprecated" in "".join(
+        [c.cell_contents for c in closures if isinstance(c.cell_contents, str)]
+    )
+    return is_deprecated

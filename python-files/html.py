@@ -1,422 +1,633 @@
-"""HTML utilities suitable for global use."""
+"""
+Module for formatting output data in HTML.
+"""
+from __future__ import annotations
 
-import html
-import json
-import re
-from html.parser import HTMLParser
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from textwrap import dedent
+from typing import (
+    Any,
+    Final,
+    Hashable,
+    Iterable,
+    Mapping,
+    cast,
+)
 
-from django.utils.encoding import punycode
-from django.utils.functional import Promise, keep_lazy, keep_lazy_text
-from django.utils.http import RFC3986_GENDELIMS, RFC3986_SUBDELIMS
-from django.utils.regex_helper import _lazy_re_compile
-from django.utils.safestring import SafeData, SafeString, mark_safe
-from django.utils.text import normalize_newlines
+from pandas._config import get_option
+
+from pandas._libs import lib
+
+from pandas import (
+    MultiIndex,
+    option_context,
+)
+
+from pandas.io.common import is_url
+from pandas.io.formats.format import (
+    DataFrameFormatter,
+    get_level_lengths,
+)
+from pandas.io.formats.printing import pprint_thing
 
 
-@keep_lazy(SafeString)
-def escape(text):
+class HTMLFormatter:
     """
-    Return the given text with ampersands, quotes and angle brackets encoded
-    for use in HTML.
-
-    Always escape input, even if it's already escaped and marked as such.
-    This may result in double-escaping. If this is a concern, use
-    conditional_escape() instead.
-    """
-    return SafeString(html.escape(str(text)))
-
-
-_js_escapes = {
-    ord("\\"): "\\u005C",
-    ord("'"): "\\u0027",
-    ord('"'): "\\u0022",
-    ord(">"): "\\u003E",
-    ord("<"): "\\u003C",
-    ord("&"): "\\u0026",
-    ord("="): "\\u003D",
-    ord("-"): "\\u002D",
-    ord(";"): "\\u003B",
-    ord("`"): "\\u0060",
-    ord("\u2028"): "\\u2028",
-    ord("\u2029"): "\\u2029",
-}
-
-# Escape every ASCII character with a value less than 32.
-_js_escapes.update((ord("%c" % z), "\\u%04X" % z) for z in range(32))
-
-
-@keep_lazy(SafeString)
-def escapejs(value):
-    """Hex encode characters for use in JavaScript strings."""
-    return mark_safe(str(value).translate(_js_escapes))
-
-
-_json_script_escapes = {
-    ord(">"): "\\u003E",
-    ord("<"): "\\u003C",
-    ord("&"): "\\u0026",
-}
-
-
-def json_script(value, element_id=None, encoder=None):
-    """
-    Escape all the HTML/XML special characters with their unicode escapes, so
-    value is safe to be output anywhere except for inside a tag attribute. Wrap
-    the escaped JSON in a script tag.
-    """
-    from django.core.serializers.json import DjangoJSONEncoder
-
-    json_str = json.dumps(value, cls=encoder or DjangoJSONEncoder).translate(
-        _json_script_escapes
-    )
-    if element_id:
-        template = '<script id="{}" type="application/json">{}</script>'
-        args = (element_id, mark_safe(json_str))
-    else:
-        template = '<script type="application/json">{}</script>'
-        args = (mark_safe(json_str),)
-    return format_html(template, *args)
-
-
-def conditional_escape(text):
-    """
-    Similar to escape(), except that it doesn't operate on pre-escaped strings.
-
-    This function relies on the __html__ convention used both by Django's
-    SafeData class and by third-party libraries like markupsafe.
-    """
-    if isinstance(text, Promise):
-        text = str(text)
-    if hasattr(text, "__html__"):
-        return text.__html__()
-    else:
-        return escape(text)
-
-
-def format_html(format_string, *args, **kwargs):
-    """
-    Similar to str.format, but pass all arguments through conditional_escape(),
-    and call mark_safe() on the result. This function should be used instead
-    of str.format or % interpolation to build up small HTML fragments.
-    """
-    args_safe = map(conditional_escape, args)
-    kwargs_safe = {k: conditional_escape(v) for (k, v) in kwargs.items()}
-    return mark_safe(format_string.format(*args_safe, **kwargs_safe))
-
-
-def format_html_join(sep, format_string, args_generator):
-    """
-    A wrapper of format_html, for the common case of a group of arguments that
-    need to be formatted using the same format string, and then joined using
-    'sep'. 'sep' is also passed through conditional_escape.
-
-    'args_generator' should be an iterator that returns the sequence of 'args'
-    that will be passed to format_html.
-
-    Example:
-
-      format_html_join('\n', "<li>{} {}</li>", ((u.first_name, u.last_name)
-                                                  for u in users))
-    """
-    return mark_safe(
-        conditional_escape(sep).join(
-            format_html(format_string, *args) for args in args_generator
-        )
-    )
-
-
-@keep_lazy_text
-def linebreaks(value, autoescape=False):
-    """Convert newlines into <p> and <br>s."""
-    value = normalize_newlines(value)
-    paras = re.split("\n{2,}", str(value))
-    if autoescape:
-        paras = ["<p>%s</p>" % escape(p).replace("\n", "<br>") for p in paras]
-    else:
-        paras = ["<p>%s</p>" % p.replace("\n", "<br>") for p in paras]
-    return "\n\n".join(paras)
-
-
-class MLStripper(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=False)
-        self.reset()
-        self.fed = []
-
-    def handle_data(self, d):
-        self.fed.append(d)
-
-    def handle_entityref(self, name):
-        self.fed.append("&%s;" % name)
-
-    def handle_charref(self, name):
-        self.fed.append("&#%s;" % name)
-
-    def get_data(self):
-        return "".join(self.fed)
-
-
-def _strip_once(value):
-    """
-    Internal tag stripping utility used by strip_tags.
-    """
-    s = MLStripper()
-    s.feed(value)
-    s.close()
-    return s.get_data()
-
-
-@keep_lazy_text
-def strip_tags(value):
-    """Return the given HTML with all tags stripped."""
-    # Note: in typical case this loop executes _strip_once once. Loop condition
-    # is redundant, but helps to reduce number of executions of _strip_once.
-    value = str(value)
-    while "<" in value and ">" in value:
-        new_value = _strip_once(value)
-        if value.count("<") == new_value.count("<"):
-            # _strip_once wasn't able to detect more tags.
-            break
-        value = new_value
-    return value
-
-
-@keep_lazy_text
-def strip_spaces_between_tags(value):
-    """Return the given HTML with spaces between tags removed."""
-    return re.sub(r">\s+<", "><", str(value))
-
-
-def smart_urlquote(url):
-    """Quote a URL if it isn't already quoted."""
-
-    def unquote_quote(segment):
-        segment = unquote(segment)
-        # Tilde is part of RFC 3986 Section 2.3 Unreserved Characters,
-        # see also https://bugs.python.org/issue16285
-        return quote(segment, safe=RFC3986_SUBDELIMS + RFC3986_GENDELIMS + "~")
-
-    # Handle IDN before quoting.
-    try:
-        scheme, netloc, path, query, fragment = urlsplit(url)
-    except ValueError:
-        # invalid IPv6 URL (normally square brackets in hostname part).
-        return unquote_quote(url)
-
-    try:
-        netloc = punycode(netloc)  # IDN -> ACE
-    except UnicodeError:  # invalid domain part
-        return unquote_quote(url)
-
-    if query:
-        # Separately unquoting key/value, so as to not mix querystring separators
-        # included in query values. See #22267.
-        query_parts = [
-            (unquote(q[0]), unquote(q[1]))
-            for q in parse_qsl(query, keep_blank_values=True)
-        ]
-        # urlencode will take care of quoting
-        query = urlencode(query_parts)
-
-    path = unquote_quote(path)
-    fragment = unquote_quote(fragment)
-
-    return urlunsplit((scheme, netloc, path, query, fragment))
-
-
-class Urlizer:
-    """
-    Convert any URLs in text into clickable links.
-
-    Work on http://, https://, www. links, and also on links ending in one of
-    the original seven gTLDs (.com, .edu, .gov, .int, .mil, .net, and .org).
-    Links can have trailing punctuation (periods, commas, close-parens) and
-    leading punctuation (opening parens) and it'll still do the right thing.
+    Internal class for formatting output data in html.
+    This class is intended for shared functionality between
+    DataFrame.to_html() and DataFrame._repr_html_().
+    Any logic in common with other output formatting methods
+    should ideally be inherited from classes in format.py
+    and this class responsible for only producing html markup.
     """
 
-    trailing_punctuation_chars = ".,:;!"
-    wrapping_punctuation = [("(", ")"), ("[", "]")]
+    indent_delta: Final = 2
 
-    simple_url_re = _lazy_re_compile(r"^https?://\[?\w", re.IGNORECASE)
-    simple_url_2_re = _lazy_re_compile(
-        r"^www\.|^(?!http)\w[^@]+\.(com|edu|gov|int|mil|net|org)($|/.*)$", re.IGNORECASE
-    )
-    word_split_re = _lazy_re_compile(r"""([\s<>"']+)""")
-
-    mailto_template = "mailto:{local}@{domain}"
-    url_template = '<a href="{href}"{attrs}>{url}</a>'
-
-    def __call__(self, text, trim_url_limit=None, nofollow=False, autoescape=False):
-        """
-        If trim_url_limit is not None, truncate the URLs in the link text
-        longer than this limit to trim_url_limit - 1 characters and append an
-        ellipsis.
-
-        If nofollow is True, give the links a rel="nofollow" attribute.
-
-        If autoescape is True, autoescape the link text and URLs.
-        """
-        safe_input = isinstance(text, SafeData)
-
-        words = self.word_split_re.split(str(text))
-        return "".join(
-            [
-                self.handle_word(
-                    word,
-                    safe_input=safe_input,
-                    trim_url_limit=trim_url_limit,
-                    nofollow=nofollow,
-                    autoescape=autoescape,
-                )
-                for word in words
-            ]
-        )
-
-    def handle_word(
+    def __init__(
         self,
-        word,
-        *,
-        safe_input,
-        trim_url_limit=None,
-        nofollow=False,
-        autoescape=False,
-    ):
-        if "." in word or "@" in word or ":" in word:
-            # lead: Punctuation trimmed from the beginning of the word.
-            # middle: State of the word.
-            # trail: Punctuation trimmed from the end of the word.
-            lead, middle, trail = self.trim_punctuation(word)
-            # Make URL we want to point to.
-            url = None
-            nofollow_attr = ' rel="nofollow"' if nofollow else ""
-            if self.simple_url_re.match(middle):
-                url = smart_urlquote(html.unescape(middle))
-            elif self.simple_url_2_re.match(middle):
-                url = smart_urlquote("http://%s" % html.unescape(middle))
-            elif ":" not in middle and self.is_email_simple(middle):
-                local, domain = middle.rsplit("@", 1)
-                try:
-                    domain = punycode(domain)
-                except UnicodeError:
-                    return word
-                url = self.mailto_template.format(local=local, domain=domain)
-                nofollow_attr = ""
-            # Make link.
-            if url:
-                trimmed = self.trim_url(middle, limit=trim_url_limit)
-                if autoescape and not safe_input:
-                    lead, trail = escape(lead), escape(trail)
-                    trimmed = escape(trimmed)
-                middle = self.url_template.format(
-                    href=escape(url),
-                    attrs=nofollow_attr,
-                    url=trimmed,
-                )
-                return mark_safe(f"{lead}{middle}{trail}")
+        formatter: DataFrameFormatter,
+        classes: str | list[str] | tuple[str, ...] | None = None,
+        border: int | bool | None = None,
+        table_id: str | None = None,
+        render_links: bool = False,
+    ) -> None:
+        self.fmt = formatter
+        self.classes = classes
+
+        self.frame = self.fmt.frame
+        self.columns = self.fmt.tr_frame.columns
+        self.elements: list[str] = []
+        self.bold_rows = self.fmt.bold_rows
+        self.escape = self.fmt.escape
+        self.show_dimensions = self.fmt.show_dimensions
+        if border is None or border is True:
+            border = cast(int, get_option("display.html.border"))
+        elif not border:
+            border = None
+
+        self.border = border
+        self.table_id = table_id
+        self.render_links = render_links
+
+        self.col_space = {
+            column: f"{value}px" if isinstance(value, int) else value
+            for column, value in self.fmt.col_space.items()
+        }
+
+    def to_string(self) -> str:
+        lines = self.render()
+        if any(isinstance(x, str) for x in lines):
+            lines = [str(x) for x in lines]
+        return "\n".join(lines)
+
+    def render(self) -> list[str]:
+        self._write_table()
+
+        if self.should_show_dimensions:
+            by = chr(215)  # ×
+            self.write(
+                f"<p>{len(self.frame)} rows {by} {len(self.frame.columns)} columns</p>"
+            )
+
+        return self.elements
+
+    @property
+    def should_show_dimensions(self) -> bool:
+        return self.fmt.should_show_dimensions
+
+    @property
+    def show_row_idx_names(self) -> bool:
+        return self.fmt.show_row_idx_names
+
+    @property
+    def show_col_idx_names(self) -> bool:
+        return self.fmt.show_col_idx_names
+
+    @property
+    def row_levels(self) -> int:
+        if self.fmt.index:
+            # showing (row) index
+            return self.frame.index.nlevels
+        elif self.show_col_idx_names:
+            # see gh-22579
+            # Column misalignment also occurs for
+            # a standard index when the columns index is named.
+            # If the row index is not displayed a column of
+            # blank cells need to be included before the DataFrame values.
+            return 1
+        # not showing (row) index
+        return 0
+
+    def _get_columns_formatted_values(self) -> Iterable:
+        return self.columns
+
+    @property
+    def is_truncated(self) -> bool:
+        return self.fmt.is_truncated
+
+    @property
+    def ncols(self) -> int:
+        return len(self.fmt.tr_frame.columns)
+
+    def write(self, s: Any, indent: int = 0) -> None:
+        rs = pprint_thing(s)
+        self.elements.append(" " * indent + rs)
+
+    def write_th(
+        self, s: Any, header: bool = False, indent: int = 0, tags: str | None = None
+    ) -> None:
+        """
+        Method for writing a formatted <th> cell.
+
+        If col_space is set on the formatter then that is used for
+        the value of min-width.
+
+        Parameters
+        ----------
+        s : object
+            The data to be written inside the cell.
+        header : bool, default False
+            Set to True if the <th> is for use inside <thead>.  This will
+            cause min-width to be set if there is one.
+        indent : int, default 0
+            The indentation level of the cell.
+        tags : str, default None
+            Tags to include in the cell.
+
+        Returns
+        -------
+        A written <th> cell.
+        """
+        col_space = self.col_space.get(s, None)
+
+        if header and col_space is not None:
+            tags = tags or ""
+            tags += f'style="min-width: {col_space};"'
+
+        self._write_cell(s, kind="th", indent=indent, tags=tags)
+
+    def write_td(self, s: Any, indent: int = 0, tags: str | None = None) -> None:
+        self._write_cell(s, kind="td", indent=indent, tags=tags)
+
+    def _write_cell(
+        self, s: Any, kind: str = "td", indent: int = 0, tags: str | None = None
+    ) -> None:
+        if tags is not None:
+            start_tag = f"<{kind} {tags}>"
+        else:
+            start_tag = f"<{kind}>"
+
+        if self.escape:
+            # escape & first to prevent double escaping of &
+            esc = {"&": r"&amp;", "<": r"&lt;", ">": r"&gt;"}
+        else:
+            esc = {}
+
+        rs = pprint_thing(s, escape_chars=esc).strip()
+
+        if self.render_links and is_url(rs):
+            rs_unescaped = pprint_thing(s, escape_chars={}).strip()
+            start_tag += f'<a href="{rs_unescaped}" target="_blank">'
+            end_a = "</a>"
+        else:
+            end_a = ""
+
+        self.write(f"{start_tag}{rs}{end_a}</{kind}>", indent)
+
+    def write_tr(
+        self,
+        line: Iterable,
+        indent: int = 0,
+        indent_delta: int = 0,
+        header: bool = False,
+        align: str | None = None,
+        tags: dict[int, str] | None = None,
+        nindex_levels: int = 0,
+    ) -> None:
+        if tags is None:
+            tags = {}
+
+        if align is None:
+            self.write("<tr>", indent)
+        else:
+            self.write(f'<tr style="text-align: {align};">', indent)
+        indent += indent_delta
+
+        for i, s in enumerate(line):
+            val_tag = tags.get(i, None)
+            if header or (self.bold_rows and i < nindex_levels):
+                self.write_th(s, indent=indent, header=header, tags=val_tag)
             else:
-                if safe_input:
-                    return mark_safe(word)
-                elif autoescape:
-                    return escape(word)
-        elif safe_input:
-            return mark_safe(word)
-        elif autoescape:
-            return escape(word)
-        return word
+                self.write_td(s, indent, tags=val_tag)
 
-    def trim_url(self, x, *, limit):
-        if limit is None or len(x) <= limit:
-            return x
-        return "%s…" % x[: max(0, limit - 1)]
+        indent -= indent_delta
+        self.write("</tr>", indent)
 
-    def trim_punctuation(self, word):
-        """
-        Trim trailing and wrapping punctuation from `word`. Return the items of
-        the new state.
-        """
-        lead, middle, trail = "", word, ""
-        # Continue trimming until middle remains unchanged.
-        trimmed_something = True
-        while trimmed_something:
-            trimmed_something = False
-            # Trim wrapping punctuation.
-            for opening, closing in self.wrapping_punctuation:
-                if middle.startswith(opening):
-                    middle = middle.removeprefix(opening)
-                    lead += opening
-                    trimmed_something = True
-                # Keep parentheses at the end only if they're balanced.
-                if (
-                    middle.endswith(closing)
-                    and middle.count(closing) == middle.count(opening) + 1
-                ):
-                    middle = middle.removesuffix(closing)
-                    trail = closing + trail
-                    trimmed_something = True
-            # Trim trailing punctuation (after trimming wrapping punctuation,
-            # as encoded entities contain ';'). Unescape entities to avoid
-            # breaking them by removing ';'.
-            middle_unescaped = html.unescape(middle)
-            stripped = middle_unescaped.rstrip(self.trailing_punctuation_chars)
-            if middle_unescaped != stripped:
-                punctuation_count = len(middle_unescaped) - len(stripped)
-                trail = middle[-punctuation_count:] + trail
-                middle = middle[:-punctuation_count]
-                trimmed_something = True
-        return lead, middle, trail
+    def _write_table(self, indent: int = 0) -> None:
+        _classes = ["dataframe"]  # Default class.
+        use_mathjax = get_option("display.html.use_mathjax")
+        if not use_mathjax:
+            _classes.append("tex2jax_ignore")
+        if self.classes is not None:
+            if isinstance(self.classes, str):
+                self.classes = self.classes.split()
+            if not isinstance(self.classes, (list, tuple)):
+                raise TypeError(
+                    "classes must be a string, list, "
+                    f"or tuple, not {type(self.classes)}"
+                )
+            _classes.extend(self.classes)
 
-    @staticmethod
-    def is_email_simple(value):
-        """Return True if value looks like an email address."""
-        # An @ must be in the middle of the value.
-        if "@" not in value or value.startswith("@") or value.endswith("@"):
-            return False
-        try:
-            p1, p2 = value.split("@")
-        except ValueError:
-            # value contains more than one @.
-            return False
-        # Dot must be in p2 (e.g. example.com)
-        if "." not in p2 or p2.startswith("."):
-            return False
-        return True
+        if self.table_id is None:
+            id_section = ""
+        else:
+            id_section = f' id="{self.table_id}"'
 
+        if self.border is None:
+            border_attr = ""
+        else:
+            border_attr = f' border="{self.border}"'
 
-urlizer = Urlizer()
-
-
-@keep_lazy_text
-def urlize(text, trim_url_limit=None, nofollow=False, autoescape=False):
-    return urlizer(
-        text, trim_url_limit=trim_url_limit, nofollow=nofollow, autoescape=autoescape
-    )
-
-
-def avoid_wrapping(value):
-    """
-    Avoid text wrapping in the middle of a phrase by adding non-breaking
-    spaces where there previously were normal spaces.
-    """
-    return value.replace(" ", "\xa0")
-
-
-def html_safe(klass):
-    """
-    A decorator that defines the __html__ method. This helps non-Django
-    templates to detect classes whose __str__ methods return SafeString.
-    """
-    if "__html__" in klass.__dict__:
-        raise ValueError(
-            "can't apply @html_safe to %s because it defines "
-            "__html__()." % klass.__name__
+        self.write(
+            f'<table{border_attr} class="{" ".join(_classes)}"{id_section}>',
+            indent,
         )
-    if "__str__" not in klass.__dict__:
-        raise ValueError(
-            "can't apply @html_safe to %s because it doesn't "
-            "define __str__()." % klass.__name__
+
+        if self.fmt.header or self.show_row_idx_names:
+            self._write_header(indent + self.indent_delta)
+
+        self._write_body(indent + self.indent_delta)
+
+        self.write("</table>", indent)
+
+    def _write_col_header(self, indent: int) -> None:
+        row: list[Hashable]
+        is_truncated_horizontally = self.fmt.is_truncated_horizontally
+        if isinstance(self.columns, MultiIndex):
+            template = 'colspan="{span:d}" halign="left"'
+
+            sentinel: lib.NoDefault | bool
+            if self.fmt.sparsify:
+                # GH3547
+                sentinel = lib.no_default
+            else:
+                sentinel = False
+            levels = self.columns.format(sparsify=sentinel, adjoin=False, names=False)
+            level_lengths = get_level_lengths(levels, sentinel)
+            inner_lvl = len(level_lengths) - 1
+            for lnum, (records, values) in enumerate(zip(level_lengths, levels)):
+                if is_truncated_horizontally:
+                    # modify the header lines
+                    ins_col = self.fmt.tr_col_num
+                    if self.fmt.sparsify:
+                        recs_new = {}
+                        # Increment tags after ... col.
+                        for tag, span in list(records.items()):
+                            if tag >= ins_col:
+                                recs_new[tag + 1] = span
+                            elif tag + span > ins_col:
+                                recs_new[tag] = span + 1
+                                if lnum == inner_lvl:
+                                    values = (
+                                        values[:ins_col] + ("...",) + values[ins_col:]
+                                    )
+                                else:
+                                    # sparse col headers do not receive a ...
+                                    values = (
+                                        values[:ins_col]
+                                        + (values[ins_col - 1],)
+                                        + values[ins_col:]
+                                    )
+                            else:
+                                recs_new[tag] = span
+                            # if ins_col lies between tags, all col headers
+                            # get ...
+                            if tag + span == ins_col:
+                                recs_new[ins_col] = 1
+                                values = values[:ins_col] + ("...",) + values[ins_col:]
+                        records = recs_new
+                        inner_lvl = len(level_lengths) - 1
+                        if lnum == inner_lvl:
+                            records[ins_col] = 1
+                    else:
+                        recs_new = {}
+                        for tag, span in list(records.items()):
+                            if tag >= ins_col:
+                                recs_new[tag + 1] = span
+                            else:
+                                recs_new[tag] = span
+                        recs_new[ins_col] = 1
+                        records = recs_new
+                        values = values[:ins_col] + ["..."] + values[ins_col:]
+
+                # see gh-22579
+                # Column Offset Bug with to_html(index=False) with
+                # MultiIndex Columns and Index.
+                # Initially fill row with blank cells before column names.
+                # TODO: Refactor to remove code duplication with code
+                # block below for standard columns index.
+                row = [""] * (self.row_levels - 1)
+                if self.fmt.index or self.show_col_idx_names:
+                    # see gh-22747
+                    # If to_html(index_names=False) do not show columns
+                    # index names.
+                    # TODO: Refactor to use _get_column_name_list from
+                    # DataFrameFormatter class and create a
+                    # _get_formatted_column_labels function for code
+                    # parity with DataFrameFormatter class.
+                    if self.fmt.show_index_names:
+                        name = self.columns.names[lnum]
+                        row.append(pprint_thing(name or ""))
+                    else:
+                        row.append("")
+
+                tags = {}
+                j = len(row)
+                for i, v in enumerate(values):
+                    if i in records:
+                        if records[i] > 1:
+                            tags[j] = template.format(span=records[i])
+                    else:
+                        continue
+                    j += 1
+                    row.append(v)
+                self.write_tr(row, indent, self.indent_delta, tags=tags, header=True)
+        else:
+            # see gh-22579
+            # Column misalignment also occurs for
+            # a standard index when the columns index is named.
+            # Initially fill row with blank cells before column names.
+            # TODO: Refactor to remove code duplication with code block
+            # above for columns MultiIndex.
+            row = [""] * (self.row_levels - 1)
+            if self.fmt.index or self.show_col_idx_names:
+                # see gh-22747
+                # If to_html(index_names=False) do not show columns
+                # index names.
+                # TODO: Refactor to use _get_column_name_list from
+                # DataFrameFormatter class.
+                if self.fmt.show_index_names:
+                    row.append(self.columns.name or "")
+                else:
+                    row.append("")
+            row.extend(self._get_columns_formatted_values())
+            align = self.fmt.justify
+
+            if is_truncated_horizontally:
+                ins_col = self.row_levels + self.fmt.tr_col_num
+                row.insert(ins_col, "...")
+
+            self.write_tr(row, indent, self.indent_delta, header=True, align=align)
+
+    def _write_row_header(self, indent: int) -> None:
+        is_truncated_horizontally = self.fmt.is_truncated_horizontally
+        row = [x if x is not None else "" for x in self.frame.index.names] + [""] * (
+            self.ncols + (1 if is_truncated_horizontally else 0)
         )
-    klass_str = klass.__str__
-    klass.__str__ = lambda self: mark_safe(klass_str(self))
-    klass.__html__ = lambda self: str(self)
-    return klass
+        self.write_tr(row, indent, self.indent_delta, header=True)
+
+    def _write_header(self, indent: int) -> None:
+        self.write("<thead>", indent)
+
+        if self.fmt.header:
+            self._write_col_header(indent + self.indent_delta)
+
+        if self.show_row_idx_names:
+            self._write_row_header(indent + self.indent_delta)
+
+        self.write("</thead>", indent)
+
+    def _get_formatted_values(self) -> dict[int, list[str]]:
+        with option_context("display.max_colwidth", None):
+            fmt_values = {i: self.fmt.format_col(i) for i in range(self.ncols)}
+        return fmt_values
+
+    def _write_body(self, indent: int) -> None:
+        self.write("<tbody>", indent)
+        fmt_values = self._get_formatted_values()
+
+        # write values
+        if self.fmt.index and isinstance(self.frame.index, MultiIndex):
+            self._write_hierarchical_rows(fmt_values, indent + self.indent_delta)
+        else:
+            self._write_regular_rows(fmt_values, indent + self.indent_delta)
+
+        self.write("</tbody>", indent)
+
+    def _write_regular_rows(
+        self, fmt_values: Mapping[int, list[str]], indent: int
+    ) -> None:
+        is_truncated_horizontally = self.fmt.is_truncated_horizontally
+        is_truncated_vertically = self.fmt.is_truncated_vertically
+
+        nrows = len(self.fmt.tr_frame)
+
+        if self.fmt.index:
+            fmt = self.fmt._get_formatter("__index__")
+            if fmt is not None:
+                index_values = self.fmt.tr_frame.index.map(fmt)
+            else:
+                index_values = self.fmt.tr_frame.index.format()
+
+        row: list[str] = []
+        for i in range(nrows):
+            if is_truncated_vertically and i == (self.fmt.tr_row_num):
+                str_sep_row = ["..."] * len(row)
+                self.write_tr(
+                    str_sep_row,
+                    indent,
+                    self.indent_delta,
+                    tags=None,
+                    nindex_levels=self.row_levels,
+                )
+
+            row = []
+            if self.fmt.index:
+                row.append(index_values[i])
+            # see gh-22579
+            # Column misalignment also occurs for
+            # a standard index when the columns index is named.
+            # Add blank cell before data cells.
+            elif self.show_col_idx_names:
+                row.append("")
+            row.extend(fmt_values[j][i] for j in range(self.ncols))
+
+            if is_truncated_horizontally:
+                dot_col_ix = self.fmt.tr_col_num + self.row_levels
+                row.insert(dot_col_ix, "...")
+            self.write_tr(
+                row, indent, self.indent_delta, tags=None, nindex_levels=self.row_levels
+            )
+
+    def _write_hierarchical_rows(
+        self, fmt_values: Mapping[int, list[str]], indent: int
+    ) -> None:
+        template = 'rowspan="{span}" valign="top"'
+
+        is_truncated_horizontally = self.fmt.is_truncated_horizontally
+        is_truncated_vertically = self.fmt.is_truncated_vertically
+        frame = self.fmt.tr_frame
+        nrows = len(frame)
+
+        assert isinstance(frame.index, MultiIndex)
+        idx_values = frame.index.format(sparsify=False, adjoin=False, names=False)
+        idx_values = list(zip(*idx_values))
+
+        if self.fmt.sparsify:
+            # GH3547
+            sentinel = lib.no_default
+            levels = frame.index.format(sparsify=sentinel, adjoin=False, names=False)
+
+            level_lengths = get_level_lengths(levels, sentinel)
+            inner_lvl = len(level_lengths) - 1
+            if is_truncated_vertically:
+                # Insert ... row and adjust idx_values and
+                # level_lengths to take this into account.
+                ins_row = self.fmt.tr_row_num
+                inserted = False
+                for lnum, records in enumerate(level_lengths):
+                    rec_new = {}
+                    for tag, span in list(records.items()):
+                        if tag >= ins_row:
+                            rec_new[tag + 1] = span
+                        elif tag + span > ins_row:
+                            rec_new[tag] = span + 1
+
+                            # GH 14882 - Make sure insertion done once
+                            if not inserted:
+                                dot_row = list(idx_values[ins_row - 1])
+                                dot_row[-1] = "..."
+                                idx_values.insert(ins_row, tuple(dot_row))
+                                inserted = True
+                            else:
+                                dot_row = list(idx_values[ins_row])
+                                dot_row[inner_lvl - lnum] = "..."
+                                idx_values[ins_row] = tuple(dot_row)
+                        else:
+                            rec_new[tag] = span
+                        # If ins_row lies between tags, all cols idx cols
+                        # receive ...
+                        if tag + span == ins_row:
+                            rec_new[ins_row] = 1
+                            if lnum == 0:
+                                idx_values.insert(
+                                    ins_row, tuple(["..."] * len(level_lengths))
+                                )
+
+                            # GH 14882 - Place ... in correct level
+                            elif inserted:
+                                dot_row = list(idx_values[ins_row])
+                                dot_row[inner_lvl - lnum] = "..."
+                                idx_values[ins_row] = tuple(dot_row)
+                    level_lengths[lnum] = rec_new
+
+                level_lengths[inner_lvl][ins_row] = 1
+                for ix_col in fmt_values:
+                    fmt_values[ix_col].insert(ins_row, "...")
+                nrows += 1
+
+            for i in range(nrows):
+                row = []
+                tags = {}
+
+                sparse_offset = 0
+                j = 0
+                for records, v in zip(level_lengths, idx_values[i]):
+                    if i in records:
+                        if records[i] > 1:
+                            tags[j] = template.format(span=records[i])
+                    else:
+                        sparse_offset += 1
+                        continue
+
+                    j += 1
+                    row.append(v)
+
+                row.extend(fmt_values[j][i] for j in range(self.ncols))
+                if is_truncated_horizontally:
+                    row.insert(
+                        self.row_levels - sparse_offset + self.fmt.tr_col_num, "..."
+                    )
+                self.write_tr(
+                    row,
+                    indent,
+                    self.indent_delta,
+                    tags=tags,
+                    nindex_levels=len(levels) - sparse_offset,
+                )
+        else:
+            row = []
+            for i in range(len(frame)):
+                if is_truncated_vertically and i == (self.fmt.tr_row_num):
+                    str_sep_row = ["..."] * len(row)
+                    self.write_tr(
+                        str_sep_row,
+                        indent,
+                        self.indent_delta,
+                        tags=None,
+                        nindex_levels=self.row_levels,
+                    )
+
+                idx_values = list(
+                    zip(*frame.index.format(sparsify=False, adjoin=False, names=False))
+                )
+                row = []
+                row.extend(idx_values[i])
+                row.extend(fmt_values[j][i] for j in range(self.ncols))
+                if is_truncated_horizontally:
+                    row.insert(self.row_levels + self.fmt.tr_col_num, "...")
+                self.write_tr(
+                    row,
+                    indent,
+                    self.indent_delta,
+                    tags=None,
+                    nindex_levels=frame.index.nlevels,
+                )
+
+
+class NotebookFormatter(HTMLFormatter):
+    """
+    Internal class for formatting output data in html for display in Jupyter
+    Notebooks. This class is intended for functionality specific to
+    DataFrame._repr_html_() and DataFrame.to_html(notebook=True)
+    """
+
+    def _get_formatted_values(self) -> dict[int, list[str]]:
+        return {i: self.fmt.format_col(i) for i in range(self.ncols)}
+
+    def _get_columns_formatted_values(self) -> list[str]:
+        return self.columns.format()
+
+    def write_style(self) -> None:
+        # We use the "scoped" attribute here so that the desired
+        # style properties for the data frame are not then applied
+        # throughout the entire notebook.
+        template_first = """\
+            <style scoped>"""
+        template_last = """\
+            </style>"""
+        template_select = """\
+                .dataframe %s {
+                    %s: %s;
+                }"""
+        element_props = [
+            ("tbody tr th:only-of-type", "vertical-align", "middle"),
+            ("tbody tr th", "vertical-align", "top"),
+        ]
+        if isinstance(self.columns, MultiIndex):
+            element_props.append(("thead tr th", "text-align", "left"))
+            if self.show_row_idx_names:
+                element_props.append(
+                    ("thead tr:last-of-type th", "text-align", "right")
+                )
+        else:
+            element_props.append(("thead th", "text-align", "right"))
+        template_mid = "\n\n".join(map(lambda t: template_select % t, element_props))
+        template = dedent("\n".join((template_first, template_mid, template_last)))
+        self.write(template)
+
+    def render(self) -> list[str]:
+        self.write("<div>")
+        self.write_style()
+        super().render()
+        self.write("</div>")
+        return self.elements

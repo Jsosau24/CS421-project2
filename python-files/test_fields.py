@@ -1,56 +1,40 @@
-import copy
+import numpy as np
+import pytest
 
-from django.contrib.gis.db.models import GeometryField
-from django.contrib.gis.db.models.sql import AreaField, DistanceField
-from django.test import SimpleTestCase
+from pandas._libs.tslibs import fields
 
-
-class FieldsTests(SimpleTestCase):
-    def test_area_field_deepcopy(self):
-        field = AreaField(None)
-        self.assertEqual(copy.deepcopy(field), field)
-
-    def test_distance_field_deepcopy(self):
-        field = DistanceField(None)
-        self.assertEqual(copy.deepcopy(field), field)
+import pandas._testing as tm
 
 
-class GeometryFieldTests(SimpleTestCase):
-    def test_deconstruct_empty(self):
-        field = GeometryField()
-        *_, kwargs = field.deconstruct()
-        self.assertEqual(kwargs, {"srid": 4326})
+@pytest.fixture
+def dtindex():
+    dtindex = np.arange(5, dtype=np.int64) * 10**9 * 3600 * 24 * 32
+    dtindex.flags.writeable = False
+    return dtindex
 
-    def test_deconstruct_values(self):
-        field = GeometryField(
-            srid=4067,
-            dim=3,
-            geography=True,
-            extent=(
-                50199.4814,
-                6582464.0358,
-                -50000.0,
-                761274.6247,
-                7799839.8902,
-                50000.0,
-            ),
-            tolerance=0.01,
-        )
-        *_, kwargs = field.deconstruct()
-        self.assertEqual(
-            kwargs,
-            {
-                "srid": 4067,
-                "dim": 3,
-                "geography": True,
-                "extent": (
-                    50199.4814,
-                    6582464.0358,
-                    -50000.0,
-                    761274.6247,
-                    7799839.8902,
-                    50000.0,
-                ),
-                "tolerance": 0.01,
-            },
-        )
+
+def test_get_date_name_field_readonly(dtindex):
+    # https://github.com/vaexio/vaex/issues/357
+    #  fields functions shouldn't raise when we pass read-only data
+    result = fields.get_date_name_field(dtindex, "month_name")
+    expected = np.array(["January", "February", "March", "April", "May"], dtype=object)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_date_field_readonly(dtindex):
+    result = fields.get_date_field(dtindex, "Y")
+    expected = np.array([1970, 1970, 1970, 1970, 1970], dtype=np.int32)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_start_end_field_readonly(dtindex):
+    result = fields.get_start_end_field(dtindex, "is_month_start", None)
+    expected = np.array([True, False, False, False, False], dtype=np.bool_)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_timedelta_field_readonly(dtindex):
+    # treat dtindex as timedeltas for this next one
+    result = fields.get_timedelta_field(dtindex, "days")
+    expected = np.arange(5, dtype=np.int32) * 32
+    tm.assert_numpy_array_equal(result, expected)

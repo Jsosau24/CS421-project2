@@ -1,81 +1,53 @@
-from django.template.defaultfilters import join
-from django.test import SimpleTestCase
-from django.utils.safestring import mark_safe
+import numpy as np
 
-from ..utils import setup
+from pandas import (
+    Index,
+    Timedelta,
+    timedelta_range,
+)
+import pandas._testing as tm
 
 
-class JoinTests(SimpleTestCase):
-    @setup({"join01": '{{ a|join:", " }}'})
-    def test_join01(self):
-        output = self.engine.render_to_string("join01", {"a": ["alpha", "beta & me"]})
-        self.assertEqual(output, "alpha, beta &amp; me")
+class TestJoin:
+    def test_append_join_nondatetimeindex(self):
+        rng = timedelta_range("1 days", periods=10)
+        idx = Index(["a", "b", "c", "d"])
 
-    @setup({"join02": '{% autoescape off %}{{ a|join:", " }}{% endautoescape %}'})
-    def test_join02(self):
-        output = self.engine.render_to_string("join02", {"a": ["alpha", "beta & me"]})
-        self.assertEqual(output, "alpha, beta & me")
+        result = rng.append(idx)
+        assert isinstance(result[0], Timedelta)
 
-    @setup({"join03": '{{ a|join:" &amp; " }}'})
-    def test_join03(self):
-        output = self.engine.render_to_string("join03", {"a": ["alpha", "beta & me"]})
-        self.assertEqual(output, "alpha &amp; beta &amp; me")
+        # it works
+        rng.join(idx, how="outer")
 
-    @setup({"join04": '{% autoescape off %}{{ a|join:" &amp; " }}{% endautoescape %}'})
-    def test_join04(self):
-        output = self.engine.render_to_string("join04", {"a": ["alpha", "beta & me"]})
-        self.assertEqual(output, "alpha &amp; beta & me")
+    def test_join_self(self, join_type):
+        index = timedelta_range("1 day", periods=10)
+        joined = index.join(index, how=join_type)
+        tm.assert_index_equal(index, joined)
 
-    # Joining with unsafe joiners doesn't result in unsafe strings.
-    @setup({"join05": "{{ a|join:var }}"})
-    def test_join05(self):
-        output = self.engine.render_to_string(
-            "join05", {"a": ["alpha", "beta & me"], "var": " & "}
+    def test_does_not_convert_mixed_integer(self):
+        df = tm.makeCustomDataframe(
+            10,
+            10,
+            data_gen_f=lambda *args, **kwargs: np.random.randn(),
+            r_idx_type="i",
+            c_idx_type="td",
         )
-        self.assertEqual(output, "alpha &amp; beta &amp; me")
+        str(df)
 
-    @setup({"join06": "{{ a|join:var }}"})
-    def test_join06(self):
-        output = self.engine.render_to_string(
-            "join06", {"a": ["alpha", "beta & me"], "var": mark_safe(" & ")}
-        )
-        self.assertEqual(output, "alpha & beta &amp; me")
+        cols = df.columns.join(df.index, how="outer")
+        joined = cols.join(df.columns)
+        assert cols.dtype == np.dtype("O")
+        assert cols.dtype == joined.dtype
+        tm.assert_index_equal(cols, joined)
 
-    @setup({"join07": "{{ a|join:var|lower }}"})
-    def test_join07(self):
-        output = self.engine.render_to_string(
-            "join07", {"a": ["Alpha", "Beta & me"], "var": " & "}
-        )
-        self.assertEqual(output, "alpha &amp; beta &amp; me")
+    def test_join_preserves_freq(self):
+        # GH#32157
+        tdi = timedelta_range("1 day", periods=10)
+        result = tdi[:5].join(tdi[5:], how="outer")
+        assert result.freq == tdi.freq
+        tm.assert_index_equal(result, tdi)
 
-    @setup({"join08": "{{ a|join:var|lower }}"})
-    def test_join08(self):
-        output = self.engine.render_to_string(
-            "join08", {"a": ["Alpha", "Beta & me"], "var": mark_safe(" & ")}
-        )
-        self.assertEqual(output, "alpha & beta &amp; me")
-
-
-class FunctionTests(SimpleTestCase):
-    def test_list(self):
-        self.assertEqual(join([0, 1, 2], "glue"), "0glue1glue2")
-
-    def test_autoescape(self):
-        self.assertEqual(
-            join(["<a>", "<img>", "</a>"], "<br>"),
-            "&lt;a&gt;&lt;br&gt;&lt;img&gt;&lt;br&gt;&lt;/a&gt;",
-        )
-
-    def test_autoescape_off(self):
-        self.assertEqual(
-            join(["<a>", "<img>", "</a>"], "<br>", autoescape=False),
-            "<a>&lt;br&gt;<img>&lt;br&gt;</a>",
-        )
-
-    def test_noniterable_arg(self):
-        obj = object()
-        self.assertEqual(join(obj, "<br>"), obj)
-
-    def test_noniterable_arg_autoescape_off(self):
-        obj = object()
-        self.assertEqual(join(obj, "<br>", autoescape=False), obj)
+        result = tdi[:5].join(tdi[6:], how="outer")
+        assert result.freq is None
+        expected = tdi.delete(5)
+        tm.assert_index_equal(result, expected)

@@ -1,274 +1,338 @@
-import inspect
+import errno
+import json
 import os
-from importlib import import_module
+import types
+import typing as t
 
-from django.core.exceptions import ImproperlyConfigured
-from django.utils.functional import cached_property
-from django.utils.module_loading import import_string, module_has_submodule
-
-APPS_MODULE_NAME = "apps"
-MODELS_MODULE_NAME = "models"
+from werkzeug.utils import import_string
 
 
-class AppConfig:
-    """Class representing a Django application and its configuration."""
+class ConfigAttribute:
+    """Makes an attribute forward to the config"""
 
-    def __init__(self, app_name, app_module):
-        # Full Python path to the application e.g. 'django.contrib.admin'.
-        self.name = app_name
+    def __init__(self, name: str, get_converter: t.Optional[t.Callable] = None) -> None:
+        self.__name__ = name
+        self.get_converter = get_converter
 
-        # Root module for the application e.g. <module 'django.contrib.admin'
-        # from 'django/contrib/admin/__init__.py'>.
-        self.module = app_module
+    def __get__(self, obj: t.Any, owner: t.Any = None) -> t.Any:
+        if obj is None:
+            return self
+        rv = obj.config[self.__name__]
+        if self.get_converter is not None:
+            rv = self.get_converter(rv)
+        return rv
 
-        # Reference to the Apps registry that holds this AppConfig. Set by the
-        # registry when it registers the AppConfig instance.
-        self.apps = None
+    def __set__(self, obj: t.Any, value: t.Any) -> None:
+        obj.config[self.__name__] = value
 
-        # The following attributes could be defined at the class level in a
-        # subclass, hence the test-and-set pattern.
 
-        # Last component of the Python path to the application e.g. 'admin'.
-        # This value must be unique across a Django project.
-        if not hasattr(self, "label"):
-            self.label = app_name.rpartition(".")[2]
-        if not self.label.isidentifier():
-            raise ImproperlyConfigured(
-                "The app label '%s' is not a valid Python identifier." % self.label
-            )
+class Config(dict):
+    """Works exactly like a dict but provides ways to fill it from files
+    or special dictionaries.  There are two common patterns to populate the
+    config.
 
-        # Human-readable name for the application e.g. "Admin".
-        if not hasattr(self, "verbose_name"):
-            self.verbose_name = self.label.title()
+    Either you can fill the config from a config file::
 
-        # Filesystem path to the application directory e.g.
-        # '/path/to/django/contrib/admin'.
-        if not hasattr(self, "path"):
-            self.path = self._path_from_module(app_module)
+        app.config.from_pyfile('yourconfig.cfg')
 
-        # Module containing models e.g. <module 'django.contrib.admin.models'
-        # from 'django/contrib/admin/models.py'>. Set by import_models().
-        # None if the application doesn't have a models module.
-        self.models_module = None
+    Or alternatively you can define the configuration options in the
+    module that calls :meth:`from_object` or provide an import path to
+    a module that should be loaded.  It is also possible to tell it to
+    use the same module and with that provide the configuration values
+    just before the call::
 
-        # Mapping of lowercase model names to model classes. Initially set to
-        # None to prevent accidental access before import_models() runs.
-        self.models = None
+        DEBUG = True
+        SECRET_KEY = 'development key'
+        app.config.from_object(__name__)
 
-    def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__name__, self.label)
+    In both cases (loading from any Python file or loading from modules),
+    only uppercase keys are added to the config.  This makes it possible to use
+    lowercase values in the config file for temporary values that are not added
+    to the config or to define the config keys in the same file that implements
+    the application.
 
-    @cached_property
-    def default_auto_field(self):
-        from django.conf import settings
+    Probably the most interesting way to load configurations is from an
+    environment variable pointing to a file::
 
-        return settings.DEFAULT_AUTO_FIELD
+        app.config.from_envvar('YOURAPPLICATION_SETTINGS')
 
-    @property
-    def _is_default_auto_field_overridden(self):
-        return self.__class__.default_auto_field is not AppConfig.default_auto_field
+    In this case before launching the application you have to set this
+    environment variable to the file you want to use.  On Linux and OS X
+    use the export statement::
 
-    def _path_from_module(self, module):
-        """Attempt to determine app's filesystem path from its module."""
-        # See #21874 for extended discussion of the behavior of this method in
-        # various cases.
-        # Convert to list because __path__ may not support indexing.
-        paths = list(getattr(module, "__path__", []))
-        if len(paths) != 1:
-            filename = getattr(module, "__file__", None)
-            if filename is not None:
-                paths = [os.path.dirname(filename)]
-            else:
-                # For unknown reasons, sometimes the list returned by __path__
-                # contains duplicates that must be removed (#25246).
-                paths = list(set(paths))
-        if len(paths) > 1:
-            raise ImproperlyConfigured(
-                "The app module %r has multiple filesystem locations (%r); "
-                "you must configure this app with an AppConfig subclass "
-                "with a 'path' class attribute." % (module, paths)
-            )
-        elif not paths:
-            raise ImproperlyConfigured(
-                "The app module %r has no filesystem location, "
-                "you must configure this app with an AppConfig subclass "
-                "with a 'path' class attribute." % module
-            )
-        return paths[0]
+        export YOURAPPLICATION_SETTINGS='/path/to/config/file'
 
-    @classmethod
-    def create(cls, entry):
+    On windows use `set` instead.
+
+    :param root_path: path to which files are read relative from.  When the
+                      config object is created by the application, this is
+                      the application's :attr:`~flask.Flask.root_path`.
+    :param defaults: an optional dictionary of default values
+    """
+
+    def __init__(self, root_path: str, defaults: t.Optional[dict] = None) -> None:
+        super().__init__(defaults or {})
+        self.root_path = root_path
+
+    def from_envvar(self, variable_name: str, silent: bool = False) -> bool:
+        """Loads a configuration from an environment variable pointing to
+        a configuration file.  This is basically just a shortcut with nicer
+        error messages for this line of code::
+
+            app.config.from_pyfile(os.environ['YOURAPPLICATION_SETTINGS'])
+
+        :param variable_name: name of the environment variable
+        :param silent: set to ``True`` if you want silent failure for missing
+                       files.
+        :return: ``True`` if the file was loaded successfully.
         """
-        Factory that creates an app config from an entry in INSTALLED_APPS.
+        rv = os.environ.get(variable_name)
+        if not rv:
+            if silent:
+                return False
+            raise RuntimeError(
+                f"The environment variable {variable_name!r} is not set"
+                " and as such configuration could not be loaded. Set"
+                " this variable and make it point to a configuration"
+                " file"
+            )
+        return self.from_pyfile(rv, silent=silent)
+
+    def from_prefixed_env(
+        self, prefix: str = "FLASK", *, loads: t.Callable[[str], t.Any] = json.loads
+    ) -> bool:
+        """Load any environment variables that start with ``FLASK_``,
+        dropping the prefix from the env key for the config key. Values
+        are passed through a loading function to attempt to convert them
+        to more specific types than strings.
+
+        Keys are loaded in :func:`sorted` order.
+
+        The default loading function attempts to parse values as any
+        valid JSON type, including dicts and lists.
+
+        Specific items in nested dicts can be set by separating the
+        keys with double underscores (``__``). If an intermediate key
+        doesn't exist, it will be initialized to an empty dict.
+
+        :param prefix: Load env vars that start with this prefix,
+            separated with an underscore (``_``).
+        :param loads: Pass each string value to this function and use
+            the returned value as the config value. If any error is
+            raised it is ignored and the value remains a string. The
+            default is :func:`json.loads`.
+
+        .. versionadded:: 2.1
         """
-        # create() eventually returns app_config_class(app_name, app_module).
-        app_config_class = None
-        app_name = None
-        app_module = None
+        prefix = f"{prefix}_"
+        len_prefix = len(prefix)
 
-        # If import_module succeeds, entry points to the app module.
-        try:
-            app_module = import_module(entry)
-        except Exception:
-            pass
-        else:
-            # If app_module has an apps submodule that defines a single
-            # AppConfig subclass, use it automatically.
-            # To prevent this, an AppConfig subclass can declare a class
-            # variable default = False.
-            # If the apps module defines more than one AppConfig subclass,
-            # the default one can declare default = True.
-            if module_has_submodule(app_module, APPS_MODULE_NAME):
-                mod_path = "%s.%s" % (entry, APPS_MODULE_NAME)
-                mod = import_module(mod_path)
-                # Check if there's exactly one AppConfig candidate,
-                # excluding those that explicitly define default = False.
-                app_configs = [
-                    (name, candidate)
-                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
-                    if (
-                        issubclass(candidate, cls)
-                        and candidate is not cls
-                        and getattr(candidate, "default", True)
-                    )
-                ]
-                if len(app_configs) == 1:
-                    app_config_class = app_configs[0][1]
-                else:
-                    # Check if there's exactly one AppConfig subclass,
-                    # among those that explicitly define default = True.
-                    app_configs = [
-                        (name, candidate)
-                        for name, candidate in app_configs
-                        if getattr(candidate, "default", False)
-                    ]
-                    if len(app_configs) > 1:
-                        candidates = [repr(name) for name, _ in app_configs]
-                        raise RuntimeError(
-                            "%r declares more than one default AppConfig: "
-                            "%s." % (mod_path, ", ".join(candidates))
-                        )
-                    elif len(app_configs) == 1:
-                        app_config_class = app_configs[0][1]
+        for key in sorted(os.environ):
+            if not key.startswith(prefix):
+                continue
 
-            # Use the default app config class if we didn't find anything.
-            if app_config_class is None:
-                app_config_class = cls
-                app_name = entry
+            value = os.environ[key]
 
-        # If import_string succeeds, entry is an app config class.
-        if app_config_class is None:
             try:
-                app_config_class = import_string(entry)
+                value = loads(value)
             except Exception:
+                # Keep the value as a string if loading failed.
                 pass
-        # If both import_module and import_string failed, it means that entry
-        # doesn't have a valid value.
-        if app_module is None and app_config_class is None:
-            # If the last component of entry starts with an uppercase letter,
-            # then it was likely intended to be an app config class; if not,
-            # an app module. Provide a nice error message in both cases.
-            mod_path, _, cls_name = entry.rpartition(".")
-            if mod_path and cls_name[0].isupper():
-                # We could simply re-trigger the string import exception, but
-                # we're going the extra mile and providing a better error
-                # message for typos in INSTALLED_APPS.
-                # This may raise ImportError, which is the best exception
-                # possible if the module at mod_path cannot be imported.
-                mod = import_module(mod_path)
-                candidates = [
-                    repr(name)
-                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
-                    if issubclass(candidate, cls) and candidate is not cls
-                ]
-                msg = "Module '%s' does not contain a '%s' class." % (
-                    mod_path,
-                    cls_name,
-                )
-                if candidates:
-                    msg += " Choices are: %s." % ", ".join(candidates)
-                raise ImportError(msg)
+
+            # Change to key.removeprefix(prefix) on Python >= 3.9.
+            key = key[len_prefix:]
+
+            if "__" not in key:
+                # A non-nested key, set directly.
+                self[key] = value
+                continue
+
+            # Traverse nested dictionaries with keys separated by "__".
+            current = self
+            *parts, tail = key.split("__")
+
+            for part in parts:
+                # If an intermediate dict does not exist, create it.
+                if part not in current:
+                    current[part] = {}
+
+                current = current[part]
+
+            current[tail] = value
+
+        return True
+
+    def from_pyfile(self, filename: str, silent: bool = False) -> bool:
+        """Updates the values in the config from a Python file.  This function
+        behaves as if the file was imported as module with the
+        :meth:`from_object` function.
+
+        :param filename: the filename of the config.  This can either be an
+                         absolute filename or a filename relative to the
+                         root path.
+        :param silent: set to ``True`` if you want silent failure for missing
+                       files.
+        :return: ``True`` if the file was loaded successfully.
+
+        .. versionadded:: 0.7
+           `silent` parameter.
+        """
+        filename = os.path.join(self.root_path, filename)
+        d = types.ModuleType("config")
+        d.__file__ = filename
+        try:
+            with open(filename, mode="rb") as config_file:
+                exec(compile(config_file.read(), filename, "exec"), d.__dict__)
+        except OSError as e:
+            if silent and e.errno in (errno.ENOENT, errno.EISDIR, errno.ENOTDIR):
+                return False
+            e.strerror = f"Unable to load configuration file ({e.strerror})"
+            raise
+        self.from_object(d)
+        return True
+
+    def from_object(self, obj: t.Union[object, str]) -> None:
+        """Updates the values from the given object.  An object can be of one
+        of the following two types:
+
+        -   a string: in this case the object with that name will be imported
+        -   an actual object reference: that object is used directly
+
+        Objects are usually either modules or classes. :meth:`from_object`
+        loads only the uppercase attributes of the module/class. A ``dict``
+        object will not work with :meth:`from_object` because the keys of a
+        ``dict`` are not attributes of the ``dict`` class.
+
+        Example of module-based configuration::
+
+            app.config.from_object('yourapplication.default_config')
+            from yourapplication import default_config
+            app.config.from_object(default_config)
+
+        Nothing is done to the object before loading. If the object is a
+        class and has ``@property`` attributes, it needs to be
+        instantiated before being passed to this method.
+
+        You should not use this function to load the actual configuration but
+        rather configuration defaults.  The actual config should be loaded
+        with :meth:`from_pyfile` and ideally from a location not within the
+        package because the package might be installed system wide.
+
+        See :ref:`config-dev-prod` for an example of class-based configuration
+        using :meth:`from_object`.
+
+        :param obj: an import name or object
+        """
+        if isinstance(obj, str):
+            obj = import_string(obj)
+        for key in dir(obj):
+            if key.isupper():
+                self[key] = getattr(obj, key)
+
+    def from_file(
+        self,
+        filename: str,
+        load: t.Callable[[t.IO[t.Any]], t.Mapping],
+        silent: bool = False,
+    ) -> bool:
+        """Update the values in the config from a file that is loaded
+        using the ``load`` parameter. The loaded data is passed to the
+        :meth:`from_mapping` method.
+
+        .. code-block:: python
+
+            import json
+            app.config.from_file("config.json", load=json.load)
+
+            import toml
+            app.config.from_file("config.toml", load=toml.load)
+
+        :param filename: The path to the data file. This can be an
+            absolute path or relative to the config root path.
+        :param load: A callable that takes a file handle and returns a
+            mapping of loaded data from the file.
+        :type load: ``Callable[[Reader], Mapping]`` where ``Reader``
+            implements a ``read`` method.
+        :param silent: Ignore the file if it doesn't exist.
+        :return: ``True`` if the file was loaded successfully.
+
+        .. versionadded:: 2.0
+        """
+        filename = os.path.join(self.root_path, filename)
+
+        try:
+            with open(filename) as f:
+                obj = load(f)
+        except OSError as e:
+            if silent and e.errno in (errno.ENOENT, errno.EISDIR):
+                return False
+
+            e.strerror = f"Unable to load configuration file ({e.strerror})"
+            raise
+
+        return self.from_mapping(obj)
+
+    def from_mapping(
+        self, mapping: t.Optional[t.Mapping[str, t.Any]] = None, **kwargs: t.Any
+    ) -> bool:
+        """Updates the config like :meth:`update` ignoring items with
+        non-upper keys.
+
+        :return: Always returns ``True``.
+
+        .. versionadded:: 0.11
+        """
+        mappings: t.Dict[str, t.Any] = {}
+        if mapping is not None:
+            mappings.update(mapping)
+        mappings.update(kwargs)
+        for key, value in mappings.items():
+            if key.isupper():
+                self[key] = value
+        return True
+
+    def get_namespace(
+        self, namespace: str, lowercase: bool = True, trim_namespace: bool = True
+    ) -> t.Dict[str, t.Any]:
+        """Returns a dictionary containing a subset of configuration options
+        that match the specified namespace/prefix. Example usage::
+
+            app.config['IMAGE_STORE_TYPE'] = 'fs'
+            app.config['IMAGE_STORE_PATH'] = '/var/app/images'
+            app.config['IMAGE_STORE_BASE_URL'] = 'http://img.website.com'
+            image_store_config = app.config.get_namespace('IMAGE_STORE_')
+
+        The resulting dictionary `image_store_config` would look like::
+
+            {
+                'type': 'fs',
+                'path': '/var/app/images',
+                'base_url': 'http://img.website.com'
+            }
+
+        This is often useful when configuration options map directly to
+        keyword arguments in functions or class constructors.
+
+        :param namespace: a configuration namespace
+        :param lowercase: a flag indicating if the keys of the resulting
+                          dictionary should be lowercase
+        :param trim_namespace: a flag indicating if the keys of the resulting
+                          dictionary should not include the namespace
+
+        .. versionadded:: 0.11
+        """
+        rv = {}
+        for k, v in self.items():
+            if not k.startswith(namespace):
+                continue
+            if trim_namespace:
+                key = k[len(namespace) :]
             else:
-                # Re-trigger the module import exception.
-                import_module(entry)
+                key = k
+            if lowercase:
+                key = key.lower()
+            rv[key] = v
+        return rv
 
-        # Check for obvious errors. (This check prevents duck typing, but
-        # it could be removed if it became a problem in practice.)
-        if not issubclass(app_config_class, AppConfig):
-            raise ImproperlyConfigured("'%s' isn't a subclass of AppConfig." % entry)
-
-        # Obtain app name here rather than in AppClass.__init__ to keep
-        # all error checking for entries in INSTALLED_APPS in one place.
-        if app_name is None:
-            try:
-                app_name = app_config_class.name
-            except AttributeError:
-                raise ImproperlyConfigured("'%s' must supply a name attribute." % entry)
-
-        # Ensure app_name points to a valid module.
-        try:
-            app_module = import_module(app_name)
-        except ImportError:
-            raise ImproperlyConfigured(
-                "Cannot import '%s'. Check that '%s.%s.name' is correct."
-                % (
-                    app_name,
-                    app_config_class.__module__,
-                    app_config_class.__qualname__,
-                )
-            )
-
-        # Entry is a path to an app config class.
-        return app_config_class(app_name, app_module)
-
-    def get_model(self, model_name, require_ready=True):
-        """
-        Return the model with the given case-insensitive model_name.
-
-        Raise LookupError if no model exists with this name.
-        """
-        if require_ready:
-            self.apps.check_models_ready()
-        else:
-            self.apps.check_apps_ready()
-        try:
-            return self.models[model_name.lower()]
-        except KeyError:
-            raise LookupError(
-                "App '%s' doesn't have a '%s' model." % (self.label, model_name)
-            )
-
-    def get_models(self, include_auto_created=False, include_swapped=False):
-        """
-        Return an iterable of models.
-
-        By default, the following models aren't included:
-
-        - auto-created models for many-to-many relations without
-          an explicit intermediate table,
-        - models that have been swapped out.
-
-        Set the corresponding keyword argument to True to include such models.
-        Keyword arguments aren't documented; they're a private API.
-        """
-        self.apps.check_models_ready()
-        for model in self.models.values():
-            if model._meta.auto_created and not include_auto_created:
-                continue
-            if model._meta.swapped and not include_swapped:
-                continue
-            yield model
-
-    def import_models(self):
-        # Dictionary of models for this app, primarily maintained in the
-        # 'all_models' attribute of the Apps this AppConfig is attached to.
-        self.models = self.apps.all_models[self.label]
-
-        if module_has_submodule(self.module, MODELS_MODULE_NAME):
-            models_module_name = "%s.%s" % (self.name, MODELS_MODULE_NAME)
-            self.models_module = import_module(models_module_name)
-
-    def ready(self):
-        """
-        Override this method in subclasses to run code when Django starts.
-        """
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} {dict.__repr__(self)}>"

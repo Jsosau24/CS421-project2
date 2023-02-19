@@ -1,140 +1,118 @@
-import logging
-import warnings
+"""
+========================
+Widget testing utilities
+========================
 
-from django.conf import settings
-from django.contrib.gis import gdal
-from django.contrib.gis.geometry import json_regex
-from django.contrib.gis.geos import GEOSException, GEOSGeometry
-from django.forms.widgets import Widget
-from django.utils import translation
-from django.utils.deprecation import RemovedInDjango51Warning
+See also :mod:`matplotlib.tests.test_widgets`.
+"""
 
-logger = logging.getLogger("django.contrib.gis")
+import matplotlib.pyplot as plt
+from unittest import mock
 
 
-class BaseGeometryWidget(Widget):
+def get_ax():
+    """Create a plot and return its axes."""
+    fig, ax = plt.subplots(1, 1)
+    ax.plot([0, 200], [0, 200])
+    ax.set_aspect(1.0)
+    ax.figure.canvas.draw()
+    return ax
+
+
+def noop(*args, **kwargs):
+    pass
+
+
+def mock_event(ax, button=1, xdata=0, ydata=0, key=None, step=1):
+    r"""
+    Create a mock event that can stand in for `.Event` and its subclasses.
+
+    This event is intended to be used in tests where it can be passed into
+    event handling functions.
+
+    Parameters
+    ----------
+    ax : `matplotlib.axes.Axes`
+        The axes the event will be in.
+    xdata : int
+        x coord of mouse in data coords.
+    ydata : int
+        y coord of mouse in data coords.
+    button : None or `MouseButton` or {'up', 'down'}
+        The mouse button pressed in this event (see also `.MouseEvent`).
+    key : None or str
+        The key pressed when the mouse event triggered (see also `.KeyEvent`).
+    step : int
+        Number of scroll steps (positive for 'up', negative for 'down').
+
+    Returns
+    -------
+    event
+        A `.Event`\-like Mock instance.
     """
-    The base class for rich geometry widgets.
-    Render a map using the WKT of the geometry.
+    event = mock.Mock()
+    event.button = button
+    event.x, event.y = ax.transData.transform([(xdata, ydata),
+                                               (xdata, ydata)])[0]
+    event.xdata, event.ydata = xdata, ydata
+    event.inaxes = ax
+    event.canvas = ax.figure.canvas
+    event.key = key
+    event.step = step
+    event.guiEvent = None
+    event.name = 'Custom'
+    return event
+
+
+def do_event(tool, etype, button=1, xdata=0, ydata=0, key=None, step=1):
     """
+    Trigger an event on the given tool.
 
-    geom_type = "GEOMETRY"
-    map_srid = 4326
-    map_width = 600  # RemovedInDjango51Warning
-    map_height = 400  # RemovedInDjango51Warning
-    display_raw = False
-
-    supports_3d = False
-    template_name = ""  # set on subclasses
-
-    def __init__(self, attrs=None):
-        self.attrs = {}
-        for key in ("geom_type", "map_srid", "map_width", "map_height", "display_raw"):
-            self.attrs[key] = getattr(self, key)
-        if (
-            (attrs and ("map_width" in attrs or "map_height" in attrs))
-            or self.map_width != 600
-            or self.map_height != 400
-        ):
-            warnings.warn(
-                "The map_height and map_width widget attributes are deprecated. Please "
-                "use CSS to size map widgets.",
-                category=RemovedInDjango51Warning,
-                stacklevel=2,
-            )
-        if attrs:
-            self.attrs.update(attrs)
-
-    def serialize(self, value):
-        return value.wkt if value else ""
-
-    def deserialize(self, value):
-        try:
-            return GEOSGeometry(value)
-        except (GEOSException, ValueError, TypeError) as err:
-            logger.error("Error creating geometry from value '%s' (%s)", value, err)
-        return None
-
-    def get_context(self, name, value, attrs):
-        context = super().get_context(name, value, attrs)
-        # If a string reaches here (via a validation error on another
-        # field) then just reconstruct the Geometry.
-        if value and isinstance(value, str):
-            value = self.deserialize(value)
-
-        if value:
-            # Check that srid of value and map match
-            if value.srid and value.srid != self.map_srid:
-                try:
-                    ogr = value.ogr
-                    ogr.transform(self.map_srid)
-                    value = ogr
-                except gdal.GDALException as err:
-                    logger.error(
-                        "Error transforming geometry from srid '%s' to srid '%s' (%s)",
-                        value.srid,
-                        self.map_srid,
-                        err,
-                    )
-
-        geom_type = gdal.OGRGeomType(self.attrs["geom_type"]).name
-        context.update(
-            self.build_attrs(
-                self.attrs,
-                {
-                    "name": name,
-                    "module": "geodjango_%s" % name.replace("-", "_"),  # JS-safe
-                    "serialized": self.serialize(value),
-                    "geom_type": "Geometry" if geom_type == "Unknown" else geom_type,
-                    "STATIC_URL": settings.STATIC_URL,
-                    "LANGUAGE_BIDI": translation.get_language_bidi(),
-                    **(attrs or {}),
-                },
-            )
-        )
-        return context
-
-
-class OpenLayersWidget(BaseGeometryWidget):
-    template_name = "gis/openlayers.html"
-    map_srid = 3857
-
-    class Media:
-        css = {
-            "all": (
-                "https://cdn.jsdelivr.net/npm/ol@v7.2.2/ol.css",
-                "gis/css/ol3.css",
-            )
-        }
-        js = (
-            "https://cdn.jsdelivr.net/npm/ol@v7.2.2/dist/ol.js",
-            "gis/js/OLMapWidget.js",
-        )
-
-    def serialize(self, value):
-        return value.json if value else ""
-
-    def deserialize(self, value):
-        geom = super().deserialize(value)
-        # GeoJSON assumes WGS84 (4326). Use the map's SRID instead.
-        if geom and json_regex.match(value) and self.map_srid != 4326:
-            geom.srid = self.map_srid
-        return geom
-
-
-class OSMWidget(OpenLayersWidget):
+    Parameters
+    ----------
+    tool : matplotlib.widgets.RectangleSelector
+    etype : str
+        The event to trigger.
+    xdata : int
+        x coord of mouse in data coords.
+    ydata : int
+        y coord of mouse in data coords.
+    button : None or `MouseButton` or {'up', 'down'}
+        The mouse button pressed in this event (see also `.MouseEvent`).
+    key : None or str
+        The key pressed when the mouse event triggered (see also `.KeyEvent`).
+    step : int
+        Number of scroll steps (positive for 'up', negative for 'down').
     """
-    An OpenLayers/OpenStreetMap-based widget.
+    event = mock_event(tool.ax, button, xdata, ydata, key, step)
+    func = getattr(tool, etype)
+    func(event)
+
+
+def click_and_drag(tool, start, end, key=None):
     """
+    Helper to simulate a mouse drag operation.
 
-    template_name = "gis/openlayers-osm.html"
-    default_lon = 5
-    default_lat = 47
-    default_zoom = 12
-
-    def __init__(self, attrs=None):
-        super().__init__()
-        for key in ("default_lon", "default_lat", "default_zoom"):
-            self.attrs[key] = getattr(self, key)
-        if attrs:
-            self.attrs.update(attrs)
+    Parameters
+    ----------
+    tool : `matplotlib.widgets.Widget`
+    start : [float, float]
+        Starting point in data coordinates.
+    end : [float, float]
+        End point in data coordinates.
+    key : None or str
+         An optional key that is pressed during the whole operation
+         (see also `.KeyEvent`).
+    """
+    if key is not None:
+        # Press key
+        do_event(tool, 'on_key_press', xdata=start[0], ydata=start[1],
+                 button=1, key=key)
+    # Click, move, and release mouse
+    do_event(tool, 'press', xdata=start[0], ydata=start[1], button=1)
+    do_event(tool, 'onmove', xdata=end[0], ydata=end[1], button=1)
+    do_event(tool, 'release', xdata=end[0], ydata=end[1], button=1)
+    if key is not None:
+        # Release key
+        do_event(tool, 'on_key_release', xdata=end[0], ydata=end[1],
+                 button=1, key=key)

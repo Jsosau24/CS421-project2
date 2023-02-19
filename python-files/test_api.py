@@ -1,72 +1,100 @@
-from django.contrib import messages
-from django.test import RequestFactory, SimpleTestCase
+import re
+
+import numpy as np
+import pytest
+
+from matplotlib import _api
 
 
-class DummyStorage:
-    """
-    dummy message-store to test the api methods
-    """
-
-    def __init__(self):
-        self.store = []
-
-    def add(self, level, message, extra_tags=""):
-        self.store.append(message)
-
-
-class ApiTests(SimpleTestCase):
-    rf = RequestFactory()
-
-    def setUp(self):
-        self.request = self.rf.request()
-        self.storage = DummyStorage()
-
-    def test_ok(self):
-        msg = "some message"
-        self.request._messages = self.storage
-        messages.add_message(self.request, messages.DEBUG, msg)
-        self.assertIn(msg, self.storage.store)
-
-    def test_request_is_none(self):
-        msg = "add_message() argument must be an HttpRequest object, not 'NoneType'."
-        self.request._messages = self.storage
-        with self.assertRaisesMessage(TypeError, msg):
-            messages.add_message(None, messages.DEBUG, "some message")
-        self.assertEqual(self.storage.store, [])
-
-    def test_middleware_missing(self):
-        msg = (
-            "You cannot add messages without installing "
-            "django.contrib.messages.middleware.MessageMiddleware"
-        )
-        with self.assertRaisesMessage(messages.MessageFailure, msg):
-            messages.add_message(self.request, messages.DEBUG, "some message")
-        self.assertEqual(self.storage.store, [])
-
-    def test_middleware_missing_silently(self):
-        messages.add_message(
-            self.request, messages.DEBUG, "some message", fail_silently=True
-        )
-        self.assertEqual(self.storage.store, [])
+@pytest.mark.parametrize('target,test_shape',
+                         [((None, ), (1, 3)),
+                          ((None, 3), (1,)),
+                          ((None, 3), (1, 2)),
+                          ((1, 5), (1, 9)),
+                          ((None, 2, None), (1, 3, 1))
+                          ])
+def test_check_shape(target, test_shape):
+    error_pattern = (f"^'aardvark' must be {len(target)}D.*" +
+                     re.escape(f'has shape {test_shape}'))
+    data = np.zeros(test_shape)
+    with pytest.raises(ValueError, match=error_pattern):
+        _api.check_shape(target, aardvark=data)
 
 
-class CustomRequest:
-    def __init__(self, request):
-        self._request = request
+def test_classproperty_deprecation():
+    class A:
+        @_api.deprecated("0.0.0")
+        @_api.classproperty
+        def f(cls):
+            pass
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        A.f
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        a = A()
+        a.f
 
-    def __getattribute__(self, attr):
-        try:
-            return super().__getattribute__(attr)
-        except AttributeError:
-            return getattr(self._request, attr)
+
+def test_deprecate_privatize_attribute():
+    class C:
+        def __init__(self): self._attr = 1
+        def _meth(self, arg): return arg
+        attr = _api.deprecate_privatize_attribute("0.0")
+        meth = _api.deprecate_privatize_attribute("0.0")
+
+    c = C()
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        assert c.attr == 1
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        c.attr = 2
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        assert c.attr == 2
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        assert c.meth(42) == 42
 
 
-class CustomRequestApiTests(ApiTests):
-    """
-    add_message() should use ducktyping to allow request wrappers such as the
-    one in Django REST framework.
-    """
+def test_delete_parameter():
+    @_api.delete_parameter("3.0", "foo")
+    def func1(foo=None):
+        pass
 
-    def setUp(self):
-        super().setUp()
-        self.request = CustomRequest(self.request)
+    @_api.delete_parameter("3.0", "foo")
+    def func2(**kwargs):
+        pass
+
+    for func in [func1, func2]:
+        func()  # No warning.
+        with pytest.warns(_api.MatplotlibDeprecationWarning):
+            func(foo="bar")
+
+    def pyplot_wrapper(foo=_api.deprecation._deprecated_parameter):
+        func1(foo)
+
+    pyplot_wrapper()  # No warning.
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        func(foo="bar")
+
+
+def test_make_keyword_only():
+    @_api.make_keyword_only("3.0", "arg")
+    def func(pre, arg, post=None):
+        pass
+
+    func(1, arg=2)  # Check that no warning is emitted.
+
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        func(1, 2)
+    with pytest.warns(_api.MatplotlibDeprecationWarning):
+        func(1, 2, 3)
+
+
+def test_deprecation_alternative():
+    alternative = "`.f1`, `f2`, `f3(x) <.f3>` or `f4(x)<f4>`"
+    @_api.deprecated("1", alternative=alternative)
+    def f():
+        pass
+    assert alternative in f.__doc__
+
+
+def test_empty_check_in_list():
+    with pytest.raises(TypeError, match="No argument to check!"):
+        _api.check_in_list(["a"])

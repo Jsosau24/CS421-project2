@@ -1,229 +1,76 @@
-import datetime
-import unittest
-
-from django.apps.registry import Apps
-from django.core.exceptions import ValidationError
-from django.db import models
-from django.test import TestCase
-
-from .models import (
-    CustomPKModel,
-    FlexibleDatePost,
-    ModelToValidate,
-    Post,
-    UniqueErrorsModel,
-    UniqueFieldsModel,
-    UniqueForDateModel,
-    UniqueFuncConstraintModel,
-    UniqueTogetherModel,
+from datetime import (
+    datetime,
+    timedelta,
 )
 
-
-class GetUniqueCheckTests(unittest.TestCase):
-    def test_unique_fields_get_collected(self):
-        m = UniqueFieldsModel()
-        self.assertEqual(
-            (
-                [
-                    (UniqueFieldsModel, ("id",)),
-                    (UniqueFieldsModel, ("unique_charfield",)),
-                    (UniqueFieldsModel, ("unique_integerfield",)),
-                ],
-                [],
-            ),
-            m._get_unique_checks(),
-        )
-
-    def test_unique_together_gets_picked_up_and_converted_to_tuple(self):
-        m = UniqueTogetherModel()
-        self.assertEqual(
-            (
-                [
-                    (UniqueTogetherModel, ("ifield", "cfield")),
-                    (UniqueTogetherModel, ("ifield", "efield")),
-                    (UniqueTogetherModel, ("id",)),
-                ],
-                [],
-            ),
-            m._get_unique_checks(),
-        )
-
-    def test_unique_together_normalization(self):
-        """
-        Test the Meta.unique_together normalization with different sorts of
-        objects.
-        """
-        data = {
-            "2-tuple": (("foo", "bar"), (("foo", "bar"),)),
-            "list": (["foo", "bar"], (("foo", "bar"),)),
-            "already normalized": (
-                (("foo", "bar"), ("bar", "baz")),
-                (("foo", "bar"), ("bar", "baz")),
-            ),
-            "set": (
-                {("foo", "bar"), ("bar", "baz")},  # Ref #21469
-                (("foo", "bar"), ("bar", "baz")),
-            ),
-        }
-
-        for unique_together, normalized in data.values():
-
-            class M(models.Model):
-                foo = models.IntegerField()
-                bar = models.IntegerField()
-                baz = models.IntegerField()
-
-                Meta = type(
-                    "Meta", (), {"unique_together": unique_together, "apps": Apps()}
-                )
-
-            checks, _ = M()._get_unique_checks()
-            for t in normalized:
-                check = (M, t)
-                self.assertIn(check, checks)
-
-    def test_primary_key_is_considered_unique(self):
-        m = CustomPKModel()
-        self.assertEqual(
-            ([(CustomPKModel, ("my_pk_field",))], []), m._get_unique_checks()
-        )
-
-    def test_unique_for_date_gets_picked_up(self):
-        m = UniqueForDateModel()
-        self.assertEqual(
-            (
-                [(UniqueForDateModel, ("id",))],
-                [
-                    (UniqueForDateModel, "date", "count", "start_date"),
-                    (UniqueForDateModel, "year", "count", "end_date"),
-                    (UniqueForDateModel, "month", "order", "end_date"),
-                ],
-            ),
-            m._get_unique_checks(),
-        )
-
-    def test_unique_for_date_exclusion(self):
-        m = UniqueForDateModel()
-        self.assertEqual(
-            (
-                [(UniqueForDateModel, ("id",))],
-                [
-                    (UniqueForDateModel, "year", "count", "end_date"),
-                    (UniqueForDateModel, "month", "order", "end_date"),
-                ],
-            ),
-            m._get_unique_checks(exclude="start_date"),
-        )
-
-    def test_func_unique_constraint_ignored(self):
-        m = UniqueFuncConstraintModel()
-        self.assertEqual(
-            m._get_unique_checks(),
-            ([(UniqueFuncConstraintModel, ("id",))], []),
-        )
+from pandas import (
+    DatetimeIndex,
+    NaT,
+    Timestamp,
+)
+import pandas._testing as tm
 
 
-class PerformUniqueChecksTest(TestCase):
-    def test_primary_key_unique_check_not_performed_when_adding_and_pk_not_specified(
-        self,
-    ):
-        # Regression test for #12560
-        with self.assertNumQueries(0):
-            mtv = ModelToValidate(number=10, name="Some Name")
-            setattr(mtv, "_adding", True)
-            mtv.full_clean()
+def test_unique(tz_naive_fixture):
+    idx = DatetimeIndex(["2017"] * 2, tz=tz_naive_fixture)
+    expected = idx[:1]
 
-    def test_primary_key_unique_check_performed_when_adding_and_pk_specified(self):
-        # Regression test for #12560
-        with self.assertNumQueries(1):
-            mtv = ModelToValidate(number=10, name="Some Name", id=123)
-            setattr(mtv, "_adding", True)
-            mtv.full_clean()
+    result = idx.unique()
+    tm.assert_index_equal(result, expected)
+    # GH#21737
+    # Ensure the underlying data is consistent
+    assert result[0] == expected[0]
 
-    def test_primary_key_unique_check_not_performed_when_not_adding(self):
-        # Regression test for #12132
-        with self.assertNumQueries(0):
-            mtv = ModelToValidate(number=10, name="Some Name")
-            mtv.full_clean()
 
-    def test_unique_for_date(self):
-        Post.objects.create(
-            title="Django 1.0 is released",
-            slug="Django 1.0",
-            subtitle="Finally",
-            posted=datetime.date(2008, 9, 3),
-        )
-        p = Post(title="Django 1.0 is released", posted=datetime.date(2008, 9, 3))
-        with self.assertRaises(ValidationError) as cm:
-            p.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict,
-            {"title": ["Title must be unique for Posted date."]},
-        )
+def test_index_unique(rand_series_with_duplicate_datetimeindex):
+    dups = rand_series_with_duplicate_datetimeindex
+    index = dups.index
 
-        # Should work without errors
-        p = Post(title="Work on Django 1.1 begins", posted=datetime.date(2008, 9, 3))
-        p.full_clean()
+    uniques = index.unique()
+    expected = DatetimeIndex(
+        [
+            datetime(2000, 1, 2),
+            datetime(2000, 1, 3),
+            datetime(2000, 1, 4),
+            datetime(2000, 1, 5),
+        ]
+    )
+    assert uniques.dtype == "M8[ns]"  # sanity
+    tm.assert_index_equal(uniques, expected)
+    assert index.nunique() == 4
 
-        # Should work without errors
-        p = Post(title="Django 1.0 is released", posted=datetime.datetime(2008, 9, 4))
-        p.full_clean()
+    # GH#2563
+    assert isinstance(uniques, DatetimeIndex)
 
-        p = Post(slug="Django 1.0", posted=datetime.datetime(2008, 1, 1))
-        with self.assertRaises(ValidationError) as cm:
-            p.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict,
-            {"slug": ["Slug must be unique for Posted year."]},
-        )
+    dups_local = index.tz_localize("US/Eastern")
+    dups_local.name = "foo"
+    result = dups_local.unique()
+    expected = DatetimeIndex(expected, name="foo")
+    expected = expected.tz_localize("US/Eastern")
+    assert result.tz is not None
+    assert result.name == "foo"
+    tm.assert_index_equal(result, expected)
 
-        p = Post(subtitle="Finally", posted=datetime.datetime(2008, 9, 30))
-        with self.assertRaises(ValidationError) as cm:
-            p.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict,
-            {"subtitle": ["Subtitle must be unique for Posted month."]},
-        )
 
-        p = Post(title="Django 1.0 is released")
-        with self.assertRaises(ValidationError) as cm:
-            p.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict, {"posted": ["This field cannot be null."]}
-        )
+def test_index_unique2():
+    # NaT, note this is excluded
+    arr = [1370745748 + t for t in range(20)] + [NaT._value]
+    idx = DatetimeIndex(arr * 3)
+    tm.assert_index_equal(idx.unique(), DatetimeIndex(arr))
+    assert idx.nunique() == 20
+    assert idx.nunique(dropna=False) == 21
 
-    def test_unique_for_date_with_nullable_date(self):
-        """
-        unique_for_date/year/month checks shouldn't trigger when the
-        associated DateField is None.
-        """
-        FlexibleDatePost.objects.create(
-            title="Django 1.0 is released",
-            slug="Django 1.0",
-            subtitle="Finally",
-            posted=datetime.date(2008, 9, 3),
-        )
-        p = FlexibleDatePost(title="Django 1.0 is released")
-        p.full_clean()
 
-        p = FlexibleDatePost(slug="Django 1.0")
-        p.full_clean()
+def test_index_unique3():
+    arr = [
+        Timestamp("2013-06-09 02:42:28") + timedelta(seconds=t) for t in range(20)
+    ] + [NaT]
+    idx = DatetimeIndex(arr * 3)
+    tm.assert_index_equal(idx.unique(), DatetimeIndex(arr))
+    assert idx.nunique() == 20
+    assert idx.nunique(dropna=False) == 21
 
-        p = FlexibleDatePost(subtitle="Finally")
-        p.full_clean()
 
-    def test_unique_errors(self):
-        UniqueErrorsModel.objects.create(name="Some Name", no=10)
-        m = UniqueErrorsModel(name="Some Name", no=11)
-        with self.assertRaises(ValidationError) as cm:
-            m.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict, {"name": ["Custom unique name message."]}
-        )
-
-        m = UniqueErrorsModel(name="Some Other Name", no=10)
-        with self.assertRaises(ValidationError) as cm:
-            m.full_clean()
-        self.assertEqual(
-            cm.exception.message_dict, {"no": ["Custom unique number message."]}
-        )
+def test_is_unique_monotonic(rand_series_with_duplicate_datetimeindex):
+    index = rand_series_with_duplicate_datetimeindex.index
+    assert not index.is_unique
