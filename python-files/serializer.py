@@ -1,395 +1,475 @@
-import builtins
-import collections.abc
-import datetime
-import decimal
-import enum
-import functools
+import sys
 import math
-import os
-import pathlib
-import re
-import types
-import uuid
 
-from django.conf import SettingsReference
-from django.db import models
-from django.db.migrations.operations.base import Operation
-from django.db.migrations.utils import COMPILED_REGEX_TYPE, RegexObject
-from django.utils.functional import LazyObject, Promise
-from django.utils.version import PY311, get_docs_version
+from datetime import datetime
 
+from sentry_sdk.utils import (
+    AnnotatedValue,
+    capture_internal_exception,
+    disable_capture_event,
+    format_timestamp,
+    json_dumps,
+    safe_repr,
+    strip_string,
+)
 
-class BaseSerializer:
-    def __init__(self, value):
-        self.value = value
+import sentry_sdk.utils
 
-    def serialize(self):
-        raise NotImplementedError(
-            "Subclasses of BaseSerializer must implement the serialize() method."
-        )
+from sentry_sdk._compat import (
+    text_type,
+    PY2,
+    string_types,
+    number_types,
+    iteritems,
+    binary_sequence_types,
+)
 
+from sentry_sdk._types import MYPY
 
-class BaseSequenceSerializer(BaseSerializer):
-    def _format(self):
-        raise NotImplementedError(
-            "Subclasses of BaseSequenceSerializer must implement the _format() method."
-        )
+if MYPY:
+    from datetime import timedelta
 
-    def serialize(self):
-        imports = set()
-        strings = []
-        for item in self.value:
-            item_string, item_imports = serializer_factory(item).serialize()
-            imports.update(item_imports)
-            strings.append(item_string)
-        value = self._format()
-        return value % (", ".join(strings)), imports
+    from types import TracebackType
 
+    from typing import Any
+    from typing import Callable
+    from typing import ContextManager
+    from typing import Dict
+    from typing import List
+    from typing import Optional
+    from typing import Tuple
+    from typing import Type
+    from typing import Union
 
-class BaseSimpleSerializer(BaseSerializer):
-    def serialize(self):
-        return repr(self.value), set()
+    from sentry_sdk._types import NotImplementedType, Event
 
+    Span = Dict[str, Any]
 
-class ChoicesSerializer(BaseSerializer):
-    def serialize(self):
-        return serializer_factory(self.value.value).serialize()
+    ReprProcessor = Callable[[Any, Dict[str, Any]], Union[NotImplementedType, str]]
+    Segment = Union[str, int]
 
 
-class DateTimeSerializer(BaseSerializer):
-    """For datetime.*, except datetime.datetime."""
+if PY2:
+    # Importing ABCs from collections is deprecated, and will stop working in 3.8
+    # https://github.com/python/cpython/blob/master/Lib/collections/__init__.py#L49
+    from collections import Mapping, Sequence, Set
 
-    def serialize(self):
-        return repr(self.value), {"import datetime"}
+    serializable_str_types = string_types + binary_sequence_types
 
+else:
+    # New in 3.3
+    # https://docs.python.org/3/library/collections.abc.html
+    from collections.abc import Mapping, Sequence, Set
 
-class DatetimeDatetimeSerializer(BaseSerializer):
-    """For datetime.datetime."""
-
-    def serialize(self):
-        if self.value.tzinfo is not None and self.value.tzinfo != datetime.timezone.utc:
-            self.value = self.value.astimezone(datetime.timezone.utc)
-        imports = ["import datetime"]
-        return repr(self.value), set(imports)
-
-
-class DecimalSerializer(BaseSerializer):
-    def serialize(self):
-        return repr(self.value), {"from decimal import Decimal"}
+    # Bytes are technically not strings in Python 3, but we can serialize them
+    serializable_str_types = string_types + binary_sequence_types
 
 
-class DeconstructableSerializer(BaseSerializer):
-    @staticmethod
-    def serialize_deconstructed(path, args, kwargs):
-        name, imports = DeconstructableSerializer._serialize_path(path)
-        strings = []
-        for arg in args:
-            arg_string, arg_imports = serializer_factory(arg).serialize()
-            strings.append(arg_string)
-            imports.update(arg_imports)
-        for kw, arg in sorted(kwargs.items()):
-            arg_string, arg_imports = serializer_factory(arg).serialize()
-            imports.update(arg_imports)
-            strings.append("%s=%s" % (kw, arg_string))
-        return "%s(%s)" % (name, ", ".join(strings)), imports
+# Maximum length of JSON-serialized event payloads that can be safely sent
+# before the server may reject the event due to its size. This is not intended
+# to reflect actual values defined server-side, but rather only be an upper
+# bound for events sent by the SDK.
+#
+# Can be overwritten if wanting to send more bytes, e.g. with a custom server.
+# When changing this, keep in mind that events may be a little bit larger than
+# this value due to attached metadata, so keep the number conservative.
+MAX_EVENT_BYTES = 10**6
 
-    @staticmethod
-    def _serialize_path(path):
-        module, name = path.rsplit(".", 1)
-        if module == "django.db.models":
-            imports = {"from django.db import models"}
-            name = "models.%s" % name
+MAX_DATABAG_DEPTH = 5
+MAX_DATABAG_BREADTH = 10
+CYCLE_MARKER = "<cyclic>"
+
+
+global_repr_processors = []  # type: List[ReprProcessor]
+
+
+def add_global_repr_processor(processor):
+    # type: (ReprProcessor) -> None
+    global_repr_processors.append(processor)
+
+
+class Memo(object):
+    __slots__ = ("_ids", "_objs")
+
+    def __init__(self):
+        # type: () -> None
+        self._ids = {}  # type: Dict[int, Any]
+        self._objs = []  # type: List[Any]
+
+    def memoize(self, obj):
+        # type: (Any) -> ContextManager[bool]
+        self._objs.append(obj)
+        return self
+
+    def __enter__(self):
+        # type: () -> bool
+        obj = self._objs[-1]
+        if id(obj) in self._ids:
+            return True
         else:
-            imports = {"import %s" % module}
-            name = path
-        return name, imports
+            self._ids[id(obj)] = obj
+            return False
 
-    def serialize(self):
-        return self.serialize_deconstructed(*self.value.deconstruct())
-
-
-class DictionarySerializer(BaseSerializer):
-    def serialize(self):
-        imports = set()
-        strings = []
-        for k, v in sorted(self.value.items()):
-            k_string, k_imports = serializer_factory(k).serialize()
-            v_string, v_imports = serializer_factory(v).serialize()
-            imports.update(k_imports)
-            imports.update(v_imports)
-            strings.append((k_string, v_string))
-        return "{%s}" % (", ".join("%s: %s" % (k, v) for k, v in strings)), imports
+    def __exit__(
+        self,
+        ty,  # type: Optional[Type[BaseException]]
+        value,  # type: Optional[BaseException]
+        tb,  # type: Optional[TracebackType]
+    ):
+        # type: (...) -> None
+        self._ids.pop(id(self._objs.pop()), None)
 
 
-class EnumSerializer(BaseSerializer):
-    def serialize(self):
-        enum_class = self.value.__class__
-        module = enum_class.__module__
-        if issubclass(enum_class, enum.Flag):
-            if PY311:
-                members = list(self.value)
+def serialize(event, smart_transaction_trimming=False, **kwargs):
+    # type: (Event, bool, **Any) -> Event
+    memo = Memo()
+    path = []  # type: List[Segment]
+    meta_stack = []  # type: List[Dict[str, Any]]
+    span_description_bytes = []  # type: List[int]
+
+    def _annotate(**meta):
+        # type: (**Any) -> None
+        while len(meta_stack) <= len(path):
+            try:
+                segment = path[len(meta_stack) - 1]
+                node = meta_stack[-1].setdefault(text_type(segment), {})
+            except IndexError:
+                node = {}
+
+            meta_stack.append(node)
+
+        meta_stack[-1].setdefault("", {}).update(meta)
+
+    def _should_repr_strings():
+        # type: () -> Optional[bool]
+        """
+        By default non-serializable objects are going through
+        safe_repr(). For certain places in the event (local vars) we
+        want to repr() even things that are JSON-serializable to
+        make their type more apparent. For example, it's useful to
+        see the difference between a unicode-string and a bytestring
+        when viewing a stacktrace.
+
+        For container-types we still don't do anything different.
+        Generally we just try to make the Sentry UI present exactly
+        what a pretty-printed repr would look like.
+
+        :returns: `True` if we are somewhere in frame variables, and `False` if
+            we are in a position where we will never encounter frame variables
+            when recursing (for example, we're in `event.extra`). `None` if we
+            are not (yet) in frame variables, but might encounter them when
+            recursing (e.g.  we're in `event.exception`)
+        """
+        try:
+            p0 = path[0]
+            if p0 == "stacktrace" and path[1] == "frames" and path[3] == "vars":
+                return True
+
+            if (
+                p0 in ("threads", "exception")
+                and path[1] == "values"
+                and path[3] == "stacktrace"
+                and path[4] == "frames"
+                and path[6] == "vars"
+            ):
+                return True
+        except IndexError:
+            return None
+
+        return False
+
+    def _is_databag():
+        # type: () -> Optional[bool]
+        """
+        A databag is any value that we need to trim.
+
+        :returns: Works like `_should_repr_strings()`. `True` for "yes",
+            `False` for :"no", `None` for "maybe soon".
+        """
+        try:
+            rv = _should_repr_strings()
+            if rv in (True, None):
+                return rv
+
+            p0 = path[0]
+            if p0 == "request" and path[1] == "data":
+                return True
+
+            if p0 == "breadcrumbs" and path[1] == "values":
+                path[2]
+                return True
+
+            if p0 == "extra":
+                return True
+
+        except IndexError:
+            return None
+
+        return False
+
+    def _serialize_node(
+        obj,  # type: Any
+        is_databag=None,  # type: Optional[bool]
+        should_repr_strings=None,  # type: Optional[bool]
+        segment=None,  # type: Optional[Segment]
+        remaining_breadth=None,  # type: Optional[int]
+        remaining_depth=None,  # type: Optional[int]
+    ):
+        # type: (...) -> Any
+        if segment is not None:
+            path.append(segment)
+
+        try:
+            with memo.memoize(obj) as result:
+                if result:
+                    return CYCLE_MARKER
+
+                return _serialize_node_impl(
+                    obj,
+                    is_databag=is_databag,
+                    should_repr_strings=should_repr_strings,
+                    remaining_depth=remaining_depth,
+                    remaining_breadth=remaining_breadth,
+                )
+        except BaseException:
+            capture_internal_exception(sys.exc_info())
+
+            if is_databag:
+                return "<failed to serialize, use init(debug=True) to see error logs>"
+
+            return None
+        finally:
+            if segment is not None:
+                path.pop()
+                del meta_stack[len(path) + 1 :]
+
+    def _flatten_annotated(obj):
+        # type: (Any) -> Any
+        if isinstance(obj, AnnotatedValue):
+            _annotate(**obj.metadata)
+            obj = obj.value
+        return obj
+
+    def _serialize_node_impl(
+        obj, is_databag, should_repr_strings, remaining_depth, remaining_breadth
+    ):
+        # type: (Any, Optional[bool], Optional[bool], Optional[int], Optional[int]) -> Any
+        if should_repr_strings is None:
+            should_repr_strings = _should_repr_strings()
+
+        if is_databag is None:
+            is_databag = _is_databag()
+
+        if is_databag and remaining_depth is None:
+            remaining_depth = MAX_DATABAG_DEPTH
+        if is_databag and remaining_breadth is None:
+            remaining_breadth = MAX_DATABAG_BREADTH
+
+        obj = _flatten_annotated(obj)
+
+        if remaining_depth is not None and remaining_depth <= 0:
+            _annotate(rem=[["!limit", "x"]])
+            if is_databag:
+                return _flatten_annotated(strip_string(safe_repr(obj)))
+            return None
+
+        if is_databag and global_repr_processors:
+            hints = {"memo": memo, "remaining_depth": remaining_depth}
+            for processor in global_repr_processors:
+                result = processor(obj, hints)
+                if result is not NotImplemented:
+                    return _flatten_annotated(result)
+
+        sentry_repr = getattr(type(obj), "__sentry_repr__", None)
+
+        if obj is None or isinstance(obj, (bool, number_types)):
+            if should_repr_strings or (
+                isinstance(obj, float) and (math.isinf(obj) or math.isnan(obj))
+            ):
+                return safe_repr(obj)
             else:
-                members, _ = enum._decompose(enum_class, self.value)
-                members = reversed(members)
-        else:
-            members = (self.value,)
-        return (
-            " | ".join(
-                [
-                    f"{module}.{enum_class.__qualname__}[{item.name!r}]"
-                    for item in members
-                ]
-            ),
-            {"import %s" % module},
-        )
+                return obj
 
+        elif callable(sentry_repr):
+            return sentry_repr(obj)
 
-class FloatSerializer(BaseSimpleSerializer):
-    def serialize(self):
-        if math.isnan(self.value) or math.isinf(self.value):
-            return 'float("{}")'.format(self.value), set()
-        return super().serialize()
-
-
-class FrozensetSerializer(BaseSequenceSerializer):
-    def _format(self):
-        return "frozenset([%s])"
-
-
-class FunctionTypeSerializer(BaseSerializer):
-    def serialize(self):
-        if getattr(self.value, "__self__", None) and isinstance(
-            self.value.__self__, type
-        ):
-            klass = self.value.__self__
-            module = klass.__module__
-            return "%s.%s.%s" % (module, klass.__name__, self.value.__name__), {
-                "import %s" % module
-            }
-        # Further error checking
-        if self.value.__name__ == "<lambda>":
-            raise ValueError("Cannot serialize function: lambda")
-        if self.value.__module__ is None:
-            raise ValueError("Cannot serialize function %r: No module" % self.value)
-
-        module_name = self.value.__module__
-
-        if "<" not in self.value.__qualname__:  # Qualname can include <locals>
-            return "%s.%s" % (module_name, self.value.__qualname__), {
-                "import %s" % self.value.__module__
-            }
-
-        raise ValueError(
-            "Could not find function %s in %s.\n" % (self.value.__name__, module_name)
-        )
-
-
-class FunctoolsPartialSerializer(BaseSerializer):
-    def serialize(self):
-        # Serialize functools.partial() arguments
-        func_string, func_imports = serializer_factory(self.value.func).serialize()
-        args_string, args_imports = serializer_factory(self.value.args).serialize()
-        keywords_string, keywords_imports = serializer_factory(
-            self.value.keywords
-        ).serialize()
-        # Add any imports needed by arguments
-        imports = {"import functools", *func_imports, *args_imports, *keywords_imports}
-        return (
-            "functools.%s(%s, *%s, **%s)"
-            % (
-                self.value.__class__.__name__,
-                func_string,
-                args_string,
-                keywords_string,
-            ),
-            imports,
-        )
-
-
-class IterableSerializer(BaseSerializer):
-    def serialize(self):
-        imports = set()
-        strings = []
-        for item in self.value:
-            item_string, item_imports = serializer_factory(item).serialize()
-            imports.update(item_imports)
-            strings.append(item_string)
-        # When len(strings)==0, the empty iterable should be serialized as
-        # "()", not "(,)" because (,) is invalid Python syntax.
-        value = "(%s)" if len(strings) != 1 else "(%s,)"
-        return value % (", ".join(strings)), imports
-
-
-class ModelFieldSerializer(DeconstructableSerializer):
-    def serialize(self):
-        attr_name, path, args, kwargs = self.value.deconstruct()
-        return self.serialize_deconstructed(path, args, kwargs)
-
-
-class ModelManagerSerializer(DeconstructableSerializer):
-    def serialize(self):
-        as_manager, manager_path, qs_path, args, kwargs = self.value.deconstruct()
-        if as_manager:
-            name, imports = self._serialize_path(qs_path)
-            return "%s.as_manager()" % name, imports
-        else:
-            return self.serialize_deconstructed(manager_path, args, kwargs)
-
-
-class OperationSerializer(BaseSerializer):
-    def serialize(self):
-        from django.db.migrations.writer import OperationWriter
-
-        string, imports = OperationWriter(self.value, indentation=0).serialize()
-        # Nested operation, trailing comma is handled in upper OperationWriter._write()
-        return string.rstrip(","), imports
-
-
-class PathLikeSerializer(BaseSerializer):
-    def serialize(self):
-        return repr(os.fspath(self.value)), {}
-
-
-class PathSerializer(BaseSerializer):
-    def serialize(self):
-        # Convert concrete paths to pure paths to avoid issues with migrations
-        # generated on one platform being used on a different platform.
-        prefix = "Pure" if isinstance(self.value, pathlib.Path) else ""
-        return "pathlib.%s%r" % (prefix, self.value), {"import pathlib"}
-
-
-class RegexSerializer(BaseSerializer):
-    def serialize(self):
-        regex_pattern, pattern_imports = serializer_factory(
-            self.value.pattern
-        ).serialize()
-        # Turn off default implicit flags (e.g. re.U) because regexes with the
-        # same implicit and explicit flags aren't equal.
-        flags = self.value.flags ^ re.compile("").flags
-        regex_flags, flag_imports = serializer_factory(flags).serialize()
-        imports = {"import re", *pattern_imports, *flag_imports}
-        args = [regex_pattern]
-        if flags:
-            args.append(regex_flags)
-        return "re.compile(%s)" % ", ".join(args), imports
-
-
-class SequenceSerializer(BaseSequenceSerializer):
-    def _format(self):
-        return "[%s]"
-
-
-class SetSerializer(BaseSequenceSerializer):
-    def _format(self):
-        # Serialize as a set literal except when value is empty because {}
-        # is an empty dict.
-        return "{%s}" if self.value else "set(%s)"
-
-
-class SettingsReferenceSerializer(BaseSerializer):
-    def serialize(self):
-        return "settings.%s" % self.value.setting_name, {
-            "from django.conf import settings"
-        }
-
-
-class TupleSerializer(BaseSequenceSerializer):
-    def _format(self):
-        # When len(value)==0, the empty tuple should be serialized as "()",
-        # not "(,)" because (,) is invalid Python syntax.
-        return "(%s)" if len(self.value) != 1 else "(%s,)"
-
-
-class TypeSerializer(BaseSerializer):
-    def serialize(self):
-        special_cases = [
-            (models.Model, "models.Model", ["from django.db import models"]),
-            (types.NoneType, "types.NoneType", ["import types"]),
-        ]
-        for case, string, imports in special_cases:
-            if case is self.value:
-                return string, set(imports)
-        if hasattr(self.value, "__module__"):
-            module = self.value.__module__
-            if module == builtins.__name__:
-                return self.value.__name__, set()
-            else:
-                return "%s.%s" % (module, self.value.__qualname__), {
-                    "import %s" % module
-                }
-
-
-class UUIDSerializer(BaseSerializer):
-    def serialize(self):
-        return "uuid.%s" % repr(self.value), {"import uuid"}
-
-
-class Serializer:
-    _registry = {
-        # Some of these are order-dependent.
-        frozenset: FrozensetSerializer,
-        list: SequenceSerializer,
-        set: SetSerializer,
-        tuple: TupleSerializer,
-        dict: DictionarySerializer,
-        models.Choices: ChoicesSerializer,
-        enum.Enum: EnumSerializer,
-        datetime.datetime: DatetimeDatetimeSerializer,
-        (datetime.date, datetime.timedelta, datetime.time): DateTimeSerializer,
-        SettingsReference: SettingsReferenceSerializer,
-        float: FloatSerializer,
-        (bool, int, types.NoneType, bytes, str, range): BaseSimpleSerializer,
-        decimal.Decimal: DecimalSerializer,
-        (functools.partial, functools.partialmethod): FunctoolsPartialSerializer,
-        (
-            types.FunctionType,
-            types.BuiltinFunctionType,
-            types.MethodType,
-        ): FunctionTypeSerializer,
-        collections.abc.Iterable: IterableSerializer,
-        (COMPILED_REGEX_TYPE, RegexObject): RegexSerializer,
-        uuid.UUID: UUIDSerializer,
-        pathlib.PurePath: PathSerializer,
-        os.PathLike: PathLikeSerializer,
-    }
-
-    @classmethod
-    def register(cls, type_, serializer):
-        if not issubclass(serializer, BaseSerializer):
-            raise ValueError(
-                "'%s' must inherit from 'BaseSerializer'." % serializer.__name__
+        elif isinstance(obj, datetime):
+            return (
+                text_type(format_timestamp(obj))
+                if not should_repr_strings
+                else safe_repr(obj)
             )
-        cls._registry[type_] = serializer
 
-    @classmethod
-    def unregister(cls, type_):
-        cls._registry.pop(type_)
+        elif isinstance(obj, Mapping):
+            # Create temporary copy here to avoid calling too much code that
+            # might mutate our dictionary while we're still iterating over it.
+            obj = dict(iteritems(obj))
 
+            rv_dict = {}  # type: Dict[str, Any]
+            i = 0
 
-def serializer_factory(value):
-    if isinstance(value, Promise):
-        value = str(value)
-    elif isinstance(value, LazyObject):
-        # The unwrapped value is returned as the first item of the arguments
-        # tuple.
-        value = value.__reduce__()[1][0]
+            for k, v in iteritems(obj):
+                if remaining_breadth is not None and i >= remaining_breadth:
+                    _annotate(len=len(obj))
+                    break
 
-    if isinstance(value, models.Field):
-        return ModelFieldSerializer(value)
-    if isinstance(value, models.manager.BaseManager):
-        return ModelManagerSerializer(value)
-    if isinstance(value, Operation):
-        return OperationSerializer(value)
-    if isinstance(value, type):
-        return TypeSerializer(value)
-    # Anything that knows how to deconstruct itself.
-    if hasattr(value, "deconstruct"):
-        return DeconstructableSerializer(value)
-    for type_, serializer_cls in Serializer._registry.items():
-        if isinstance(value, type_):
-            return serializer_cls(value)
-    raise ValueError(
-        "Cannot serialize: %r\nThere are some values Django cannot serialize into "
-        "migration files.\nFor more, see https://docs.djangoproject.com/en/%s/"
-        "topics/migrations/#migration-serializing" % (value, get_docs_version())
-    )
+                str_k = text_type(k)
+                v = _serialize_node(
+                    v,
+                    segment=str_k,
+                    should_repr_strings=should_repr_strings,
+                    is_databag=is_databag,
+                    remaining_depth=remaining_depth - 1
+                    if remaining_depth is not None
+                    else None,
+                    remaining_breadth=remaining_breadth,
+                )
+                rv_dict[str_k] = v
+                i += 1
+
+            return rv_dict
+
+        elif not isinstance(obj, serializable_str_types) and isinstance(
+            obj, (Set, Sequence)
+        ):
+            rv_list = []
+
+            for i, v in enumerate(obj):
+                if remaining_breadth is not None and i >= remaining_breadth:
+                    _annotate(len=len(obj))
+                    break
+
+                rv_list.append(
+                    _serialize_node(
+                        v,
+                        segment=i,
+                        should_repr_strings=should_repr_strings,
+                        is_databag=is_databag,
+                        remaining_depth=remaining_depth - 1
+                        if remaining_depth is not None
+                        else None,
+                        remaining_breadth=remaining_breadth,
+                    )
+                )
+
+            return rv_list
+
+        if should_repr_strings:
+            obj = safe_repr(obj)
+        else:
+            if isinstance(obj, bytes) or isinstance(obj, bytearray):
+                obj = obj.decode("utf-8", "replace")
+
+            if not isinstance(obj, string_types):
+                obj = safe_repr(obj)
+
+        # Allow span descriptions to be longer than other strings.
+        #
+        # For database auto-instrumented spans, the description contains
+        # potentially long SQL queries that are most useful when not truncated.
+        # Because arbitrarily large events may be discarded by the server as a
+        # protection mechanism, we dynamically limit the description length
+        # later in _truncate_span_descriptions.
+        if (
+            smart_transaction_trimming
+            and len(path) == 3
+            and path[0] == "spans"
+            and path[-1] == "description"
+        ):
+            span_description_bytes.append(len(obj))
+            return obj
+        return _flatten_annotated(strip_string(obj))
+
+    def _truncate_span_descriptions(serialized_event, event, excess_bytes):
+        # type: (Event, Event, int) -> None
+        """
+        Modifies serialized_event in-place trying to remove excess_bytes from
+        span descriptions. The original event is used read-only to access the
+        span timestamps (represented as RFC3399-formatted strings in
+        serialized_event).
+
+        It uses heuristics to prioritize preserving the description of spans
+        that might be the most interesting ones in terms of understanding and
+        optimizing performance.
+        """
+        # When truncating a description, preserve a small prefix.
+        min_length = 10
+
+        def shortest_duration_longest_description_first(args):
+            # type: (Tuple[int, Span]) -> Tuple[timedelta, int]
+            i, serialized_span = args
+            span = event["spans"][i]
+            now = datetime.utcnow()
+            start = span.get("start_timestamp") or now
+            end = span.get("timestamp") or now
+            duration = end - start
+            description = serialized_span.get("description") or ""
+            return (duration, -len(description))
+
+        # Note: for simplicity we sort spans by exact duration and description
+        # length. If ever needed, we could have a more involved heuristic, e.g.
+        # replacing exact durations with "buckets" and/or looking at other span
+        # properties.
+        path.append("spans")
+        for i, span in sorted(
+            enumerate(serialized_event.get("spans") or []),
+            key=shortest_duration_longest_description_first,
+        ):
+            description = span.get("description") or ""
+            if len(description) <= min_length:
+                continue
+            excess_bytes -= len(description) - min_length
+            path.extend([i, "description"])
+            # Note: the last time we call strip_string we could preserve a few
+            # more bytes up to a total length of MAX_EVENT_BYTES. Since that's
+            # not strictly required, we leave it out for now for simplicity.
+            span["description"] = _flatten_annotated(
+                strip_string(description, max_length=min_length)
+            )
+            del path[-2:]
+            del meta_stack[len(path) + 1 :]
+
+            if excess_bytes <= 0:
+                break
+        path.pop()
+        del meta_stack[len(path) + 1 :]
+
+    disable_capture_event.set(True)
+    try:
+        rv = _serialize_node(event, **kwargs)
+        if meta_stack and isinstance(rv, dict):
+            rv["_meta"] = meta_stack[0]
+
+        sum_span_description_bytes = sum(span_description_bytes)
+        if smart_transaction_trimming and sum_span_description_bytes > 0:
+            span_count = len(event.get("spans") or [])
+            # This is an upper bound of how many bytes all descriptions would
+            # consume if the usual string truncation in _serialize_node_impl
+            # would have taken place, not accounting for the metadata attached
+            # as event["_meta"].
+            descriptions_budget_bytes = span_count * sentry_sdk.utils.MAX_STRING_LENGTH
+
+            # If by not truncating descriptions we ended up with more bytes than
+            # per the usual string truncation, check if the event is too large
+            # and we need to truncate some descriptions.
+            #
+            # This is guarded with an if statement to avoid JSON-encoding the
+            # event unnecessarily.
+            if sum_span_description_bytes > descriptions_budget_bytes:
+                original_bytes = len(json_dumps(rv))
+                excess_bytes = original_bytes - MAX_EVENT_BYTES
+                if excess_bytes > 0:
+                    # Event is too large, will likely be discarded by the
+                    # server. Trim it down before sending.
+                    _truncate_span_descriptions(rv, event, excess_bytes)
+
+                    # Span descriptions truncated, set or reset _meta.
+                    #
+                    # We run the same code earlier because we want to account
+                    # for _meta when calculating original_bytes, the number of
+                    # bytes in the JSON-encoded event.
+                    if meta_stack and isinstance(rv, dict):
+                        rv["_meta"] = meta_stack[0]
+        return rv
+    finally:
+        disable_capture_event.set(False)

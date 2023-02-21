@@ -1,32 +1,81 @@
-# This file is not meant for public use and will be removed in SciPy v2.0.0.
-# Use the `scipy.signal.windows` namespace for importing the functions
-# included below.
+"""Windows integration testing."""
+from __future__ import annotations
 
-import warnings
-from . import _windows
+import os
 
-__all__ = [  # noqa: F822
-    'boxcar', 'triang', 'parzen', 'bohman', 'blackman', 'nuttall',
-    'blackmanharris', 'flattop', 'bartlett', 'barthann',
-    'hamming', 'kaiser', 'gaussian', 'general_cosine',
-    'general_gaussian', 'general_hamming', 'chebwin', 'cosine',
-    'hann', 'exponential', 'tukey', 'taylor', 'dpss', 'get_window',
-    'linalg', 'sp_fft', 'k', 'v', 'key'
-]
+from ...util import (
+    ApplicationError,
+    ANSIBLE_TEST_CONFIG_ROOT,
+)
+
+from ...util_common import (
+    handle_layout_messages,
+)
+
+from ...containers import (
+    create_container_hooks,
+    local_ssh,
+    root_ssh,
+)
+
+from ...target import (
+    walk_windows_integration_targets,
+)
+
+from ...config import (
+    WindowsIntegrationConfig,
+)
+
+from ...host_configs import (
+    WindowsInventoryConfig,
+    WindowsRemoteConfig,
+)
+
+from . import (
+    command_integration_filter,
+    command_integration_filtered,
+    get_inventory_absolute_path,
+    get_inventory_relative_path,
+    check_inventory,
+    delegate_inventory,
+)
+
+from ...data import (
+    data_context,
+)
 
 
-def __dir__():
-    return __all__
+def command_windows_integration(args: WindowsIntegrationConfig) -> None:
+    """Entry point for the `windows-integration` command."""
+    handle_layout_messages(data_context().content.integration_messages)
 
+    inventory_relative_path = get_inventory_relative_path(args)
+    template_path = os.path.join(ANSIBLE_TEST_CONFIG_ROOT, os.path.basename(inventory_relative_path)) + '.template'
 
-def __getattr__(name):
-    if name not in __all__:
-        raise AttributeError(
-            "scipy.signal.windows.windows is deprecated and has no attribute "
-            f"{name}. Try looking in scipy.signal.windows instead.")
+    if issubclass(args.target_type, WindowsInventoryConfig):
+        target = args.only_target(WindowsInventoryConfig)
+        inventory_path = get_inventory_absolute_path(args, target)
 
-    warnings.warn(f"Please use `{name}` from the `scipy.signal.windows` namespace, "
-                  "the `scipy.signal.windows.windows` namespace is deprecated.",
-                  category=DeprecationWarning, stacklevel=2)
+        if args.delegate or not target.path:
+            target.path = inventory_relative_path
+    else:
+        inventory_path = os.path.join(data_context().content.root, inventory_relative_path)
 
-    return getattr(_windows, name)
+    if not args.explain and not issubclass(args.target_type, WindowsRemoteConfig) and not os.path.isfile(inventory_path):
+        raise ApplicationError(
+            'Inventory not found: %s\n'
+            'Use --inventory to specify the inventory path.\n'
+            'Use --windows to provision resources and generate an inventory file.\n'
+            'See also inventory template: %s' % (inventory_path, template_path)
+        )
+
+    check_inventory(args, inventory_path)
+    delegate_inventory(args, inventory_path)
+
+    all_targets = tuple(walk_windows_integration_targets(include_hidden=True))
+    host_state, internal_targets = command_integration_filter(args, all_targets)
+    control_connections = [local_ssh(args, host_state.controller_profile.python)]
+    managed_connections = [root_ssh(ssh) for ssh in host_state.get_controller_target_connections()]
+    pre_target, post_target = create_container_hooks(args, control_connections, managed_connections)
+
+    command_integration_filtered(args, host_state, internal_targets, all_targets, inventory_path, pre_target=pre_target, post_target=post_target)

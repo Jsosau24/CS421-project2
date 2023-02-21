@@ -1,94 +1,110 @@
-"""
-Internal module for console introspection
-"""
-from __future__ import annotations
-
-from shutil import get_terminal_size
+from functools import wraps
 
 
-def get_console_size() -> tuple[int | None, int | None]:
-    """
-    Return console size as tuple = (width, height).
-
-    Returns (None,None) in non-interactive session.
-    """
-    from pandas import get_option
-
-    display_width = get_option("display.width")
-    display_height = get_option("display.max_rows")
-
-    # Consider
-    # interactive shell terminal, can detect term size
-    # interactive non-shell terminal (ipnb/ipqtconsole), cannot detect term
-    # size non-interactive script, should disregard term size
-
-    # in addition
-    # width,height have default values, but setting to 'None' signals
-    # should use Auto-Detection, But only in interactive shell-terminal.
-    # Simple. yeah.
-
-    if in_interactive_session():
-        if in_ipython_frontend():
-            # sane defaults for interactive non-shell terminal
-            # match default for width,height in config_init
-            from pandas._config.config import get_default_val
-
-            terminal_width = get_default_val("display.width")
-            terminal_height = get_default_val("display.max_rows")
-        else:
-            # pure terminal
-            terminal_width, terminal_height = get_terminal_size()
-    else:
-        terminal_width, terminal_height = None, None
-
-    # Note if the User sets width/Height to None (auto-detection)
-    # and we're in a script (non-inter), this will return (None,None)
-    # caller needs to deal.
-    return display_width or terminal_width, display_height or terminal_height
-
-
-# ----------------------------------------------------------------------
-# Detect our environment
-
-
-def in_interactive_session() -> bool:
-    """
-    Check if we're running in an interactive shell.
-
-    Returns
-    -------
-    bool
-        True if running under python/ipython interactive shell.
-    """
-    from pandas import get_option
-
-    def check_main():
-        try:
-            import __main__ as main
-        except ModuleNotFoundError:
-            return get_option("mode.sim_interactive")
-        return not hasattr(main, "__file__") or get_option("mode.sim_interactive")
-
+def _embed_ipython_shell(namespace={}, banner=""):
+    """Start an IPython Shell"""
     try:
-        # error: Name '__IPYTHON__' is not defined
-        return __IPYTHON__ or check_main()  # type: ignore[name-defined]
-    except NameError:
-        return check_main()
+        from IPython.terminal.embed import InteractiveShellEmbed
+        from IPython.terminal.ipapp import load_default_config
+    except ImportError:
+        from IPython.frontend.terminal.embed import InteractiveShellEmbed
+        from IPython.frontend.terminal.ipapp import load_default_config
+
+    @wraps(_embed_ipython_shell)
+    def wrapper(namespace=namespace, banner=""):
+        config = load_default_config()
+        # Always use .instance() to ensure _instance propagation to all parents
+        # this is needed for <TAB> completion works well for new imports
+        # and clear the instance to always have the fresh env
+        # on repeated breaks like with inspect_response()
+        InteractiveShellEmbed.clear_instance()
+        shell = InteractiveShellEmbed.instance(
+            banner1=banner, user_ns=namespace, config=config
+        )
+        shell()
+
+    return wrapper
 
 
-def in_ipython_frontend() -> bool:
-    """
-    Check if we're inside an IPython zmq frontend.
+def _embed_bpython_shell(namespace={}, banner=""):
+    """Start a bpython shell"""
+    import bpython
 
-    Returns
-    -------
-    bool
-    """
-    try:
-        # error: Name 'get_ipython' is not defined
-        ip = get_ipython()  # type: ignore[name-defined]
-        return "zmq" in str(type(ip)).lower()
-    except NameError:
+    @wraps(_embed_bpython_shell)
+    def wrapper(namespace=namespace, banner=""):
+        bpython.embed(locals_=namespace, banner=banner)
+
+    return wrapper
+
+
+def _embed_ptpython_shell(namespace={}, banner=""):
+    """Start a ptpython shell"""
+    import ptpython.repl
+
+    @wraps(_embed_ptpython_shell)
+    def wrapper(namespace=namespace, banner=""):
+        print(banner)
+        ptpython.repl.embed(locals=namespace)
+
+    return wrapper
+
+
+def _embed_standard_shell(namespace={}, banner=""):
+    """Start a standard python shell"""
+    import code
+
+    try:  # readline module is only available on unix systems
+        import readline
+    except ImportError:
         pass
+    else:
+        import rlcompleter  # noqa: F401
 
-    return False
+        readline.parse_and_bind("tab:complete")
+
+    @wraps(_embed_standard_shell)
+    def wrapper(namespace=namespace, banner=""):
+        code.interact(banner=banner, local=namespace)
+
+    return wrapper
+
+
+DEFAULT_PYTHON_SHELLS = {
+    "ptpython": _embed_ptpython_shell,
+    "ipython": _embed_ipython_shell,
+    "bpython": _embed_bpython_shell,
+    "python": _embed_standard_shell,
+}
+
+
+def get_shell_embed_func(shells=None, known_shells=None):
+    """Return the first acceptable shell-embed function
+    from a given list of shell names.
+    """
+    if shells is None:  # list, preference order of shells
+        shells = DEFAULT_PYTHON_SHELLS.keys()
+    if known_shells is None:  # available embeddable shells
+        known_shells = DEFAULT_PYTHON_SHELLS.copy()
+    for shell in shells:
+        if shell in known_shells:
+            try:
+                # function test: run all setup code (imports),
+                # but dont fall into the shell
+                return known_shells[shell]()
+            except ImportError:
+                continue
+
+
+def start_python_console(namespace=None, banner="", shells=None):
+    """Start Python console bound to the given namespace.
+    Readline support and tab completion will be used on Unix, if available.
+    """
+    if namespace is None:
+        namespace = {}
+
+    try:
+        shell = get_shell_embed_func(shells)
+        if shell is not None:
+            shell(namespace=namespace, banner=banner)
+    except SystemExit:  # raised when using exit() in python code.interact
+        pass

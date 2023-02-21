@@ -1,98 +1,234 @@
-import logging
+# coding: utf-8
 import sys
-from io import StringIO
 
 import pytest
+import logging
+import warnings
 
-from flask.logging import default_handler
-from flask.logging import has_level_handler
-from flask.logging import wsgi_errors_stream
+from sentry_sdk.integrations.logging import LoggingIntegration, ignore_logger
+
+other_logger = logging.getLogger("testfoo")
+logger = logging.getLogger(__name__)
 
 
 @pytest.fixture(autouse=True)
-def reset_logging(pytestconfig):
-    root_handlers = logging.root.handlers[:]
-    logging.root.handlers = []
-    root_level = logging.root.level
-
-    logger = logging.getLogger("flask_test")
-    logger.handlers = []
-    logger.setLevel(logging.NOTSET)
-
-    logging_plugin = pytestconfig.pluginmanager.unregister(name="logging-plugin")
-
-    yield
-
-    logging.root.handlers[:] = root_handlers
-    logging.root.setLevel(root_level)
-
-    logger.handlers = []
-    logger.setLevel(logging.NOTSET)
-
-    if logging_plugin:
-        pytestconfig.pluginmanager.register(logging_plugin, "logging-plugin")
+def reset_level():
+    other_logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
 
 
-def test_logger(app):
-    assert app.logger.name == "flask_test"
-    assert app.logger.level == logging.NOTSET
-    assert app.logger.handlers == [default_handler]
+@pytest.mark.parametrize("logger", [logger, other_logger])
+def test_logging_works_with_many_loggers(sentry_init, capture_events, logger):
+    sentry_init(integrations=[LoggingIntegration(event_level="ERROR")])
+    events = capture_events()
+
+    logger.info("bread")
+    logger.critical("LOL")
+    (event,) = events
+    assert event["level"] == "fatal"
+    assert not event["logentry"]["params"]
+    assert event["logentry"]["message"] == "LOL"
+    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"]["values"])
 
 
-def test_logger_debug(app):
-    app.debug = True
-    assert app.logger.level == logging.DEBUG
-    assert app.logger.handlers == [default_handler]
+@pytest.mark.parametrize("integrations", [None, [], [LoggingIntegration()]])
+@pytest.mark.parametrize(
+    "kwargs", [{"exc_info": None}, {}, {"exc_info": 0}, {"exc_info": False}]
+)
+def test_logging_defaults(integrations, sentry_init, capture_events, kwargs):
+    sentry_init(integrations=integrations)
+    events = capture_events()
+
+    logger.info("bread")
+    logger.critical("LOL", **kwargs)
+    (event,) = events
+
+    assert event["level"] == "fatal"
+    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"]["values"])
+    assert not any(
+        crumb["message"] == "LOL" for crumb in event["breadcrumbs"]["values"]
+    )
+    assert "threads" not in event
 
 
-def test_existing_handler(app):
-    logging.root.addHandler(logging.StreamHandler())
-    assert app.logger.level == logging.NOTSET
-    assert not app.logger.handlers
+def test_logging_extra_data(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    logger.info("bread", extra=dict(foo=42))
+    logger.critical("lol", extra=dict(bar=69))
+
+    (event,) = events
+
+    assert event["level"] == "fatal"
+    assert event["extra"] == {"bar": 69}
+    assert any(
+        crumb["message"] == "bread" and crumb["data"] == {"foo": 42}
+        for crumb in event["breadcrumbs"]["values"]
+    )
 
 
-def test_wsgi_errors_stream(app, client):
-    @app.route("/")
-    def index():
-        app.logger.error("test")
-        return ""
+def test_logging_extra_data_integer_keys(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
 
-    stream = StringIO()
-    client.get("/", errors_stream=stream)
-    assert "ERROR in test_logging: test" in stream.getvalue()
+    logger.critical("integer in extra keys", extra={1: 1})
 
-    assert wsgi_errors_stream._get_current_object() is sys.stderr
+    (event,) = events
 
-    with app.test_request_context(errors_stream=stream):
-        assert wsgi_errors_stream._get_current_object() is stream
+    assert event["extra"] == {"1": 1}
 
 
-def test_has_level_handler():
-    logger = logging.getLogger("flask.app")
-    assert not has_level_handler(logger)
+@pytest.mark.xfail(sys.version_info[:2] == (3, 4), reason="buggy logging module")
+def test_logging_stack(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
 
-    handler = logging.StreamHandler()
-    logging.root.addHandler(handler)
-    assert has_level_handler(logger)
+    logger.error("first", exc_info=True)
+    logger.error("second")
 
-    logger.propagate = False
-    assert not has_level_handler(logger)
-    logger.propagate = True
+    (
+        event_with,
+        event_without,
+    ) = events
 
-    handler.setLevel(logging.ERROR)
-    assert not has_level_handler(logger)
+    assert event_with["level"] == "error"
+    assert event_with["threads"]["values"][0]["stacktrace"]["frames"]
+
+    assert event_without["level"] == "error"
+    assert "threads" not in event_without
 
 
-def test_log_view_exception(app, client):
-    @app.route("/")
-    def index():
-        raise Exception("test")
+def test_logging_level(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
 
-    app.testing = False
-    stream = StringIO()
-    rv = client.get("/", errors_stream=stream)
-    assert rv.status_code == 500
-    assert rv.data
-    err = stream.getvalue()
-    assert "Exception on / [GET]" in err
-    assert "Exception: test" in err
+    logger.setLevel(logging.WARNING)
+    logger.error("hi")
+    (event,) = events
+    assert event["level"] == "error"
+    assert event["logentry"]["message"] == "hi"
+
+    del events[:]
+
+    logger.setLevel(logging.ERROR)
+    logger.warning("hi")
+    assert not events
+
+
+def test_custom_log_level_names(sentry_init, capture_events):
+    levels = {
+        logging.DEBUG: "debug",
+        logging.INFO: "info",
+        logging.WARN: "warning",
+        logging.WARNING: "warning",
+        logging.ERROR: "error",
+        logging.CRITICAL: "fatal",
+        logging.FATAL: "fatal",
+    }
+
+    # set custom log level names
+    # fmt: off
+    logging.addLevelName(logging.DEBUG, u"custom level debüg: ")
+    # fmt: on
+    logging.addLevelName(logging.INFO, "")
+    logging.addLevelName(logging.WARN, "custom level warn: ")
+    logging.addLevelName(logging.WARNING, "custom level warning: ")
+    logging.addLevelName(logging.ERROR, None)
+    logging.addLevelName(logging.CRITICAL, "custom level critical: ")
+    logging.addLevelName(logging.FATAL, "custom level 🔥: ")
+
+    for logging_level, sentry_level in levels.items():
+        logger.setLevel(logging_level)
+        sentry_init(
+            integrations=[LoggingIntegration(event_level=logging_level)],
+            default_integrations=False,
+        )
+        events = capture_events()
+
+        logger.log(logging_level, "Trying level %s", logging_level)
+        assert events
+        assert events[0]["level"] == sentry_level
+        assert events[0]["logentry"]["message"] == "Trying level %s"
+        assert events[0]["logentry"]["params"] == [logging_level]
+
+        del events[:]
+
+
+def test_logging_filters(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    should_log = False
+
+    class MyFilter(logging.Filter):
+        def filter(self, record):
+            return should_log
+
+    logger.addFilter(MyFilter())
+    logger.error("hi")
+
+    assert not events
+
+    should_log = True
+    logger.error("hi")
+
+    (event,) = events
+    assert event["logentry"]["message"] == "hi"
+
+
+def test_logging_captured_warnings(sentry_init, capture_events, recwarn):
+    sentry_init(
+        integrations=[LoggingIntegration(event_level="WARNING")],
+        default_integrations=False,
+    )
+    events = capture_events()
+
+    logging.captureWarnings(True)
+    warnings.warn("first")
+    warnings.warn("second")
+    logging.captureWarnings(False)
+
+    warnings.warn("third")
+
+    assert len(events) == 2
+
+    assert events[0]["level"] == "warning"
+    # Captured warnings start with the path where the warning was raised
+    assert "UserWarning: first" in events[0]["logentry"]["message"]
+    assert events[0]["logentry"]["params"] == []
+
+    assert events[1]["level"] == "warning"
+    assert "UserWarning: second" in events[1]["logentry"]["message"]
+    assert events[1]["logentry"]["params"] == []
+
+    # Using recwarn suppresses the "third" warning in the test output
+    assert len(recwarn) == 1
+    assert str(recwarn[0].message) == "third"
+
+
+def test_ignore_logger(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    ignore_logger("testfoo")
+
+    other_logger.error("hi")
+
+    assert not events
+
+
+def test_ignore_logger_wildcard(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    ignore_logger("testfoo.*")
+
+    nested_logger = logging.getLogger("testfoo.submodule")
+
+    logger.error("hi")
+
+    nested_logger.error("bye")
+
+    (event,) = events
+    assert event["logentry"]["message"] == "hi"

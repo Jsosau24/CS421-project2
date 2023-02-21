@@ -1,160 +1,120 @@
-import numpy as np
-import pytest
+"""Identify aggregated coverage in one file missing from another."""
+from __future__ import annotations
 
-import pandas as pd
-import pandas._testing as tm
-from pandas.api.types import is_sparse
-from pandas.tests.extension.base.base import BaseExtensionTests
+import os
+import typing as t
+
+from .....encoding import (
+    to_bytes,
+)
+
+from .....executor import (
+    Delegate,
+)
+
+from .....provisioning import (
+    prepare_profiles,
+)
+
+from . import (
+    CoverageAnalyzeTargetsConfig,
+    get_target_index,
+    make_report,
+    read_report,
+    write_report,
+)
+
+from . import (
+    TargetIndexes,
+    IndexedPoints,
+)
 
 
-class BaseMissingTests(BaseExtensionTests):
-    def test_isna(self, data_missing):
-        expected = np.array([True, False])
+class CoverageAnalyzeTargetsMissingConfig(CoverageAnalyzeTargetsConfig):
+    """Configuration for the `coverage analyze targets missing` command."""
 
-        result = pd.isna(data_missing)
-        tm.assert_numpy_array_equal(result, expected)
+    def __init__(self, args: t.Any) -> None:
+        super().__init__(args)
 
-        result = pd.Series(data_missing).isna()
-        expected = pd.Series(expected)
-        self.assert_series_equal(result, expected)
+        self.from_file: str = args.from_file
+        self.to_file: str = args.to_file
+        self.output_file: str = args.output_file
 
-        # GH 21189
-        result = pd.Series(data_missing).drop([0, 1]).isna()
-        expected = pd.Series([], dtype=bool)
-        self.assert_series_equal(result, expected)
+        self.only_gaps: bool = args.only_gaps
+        self.only_exists: bool = args.only_exists
 
-    @pytest.mark.parametrize("na_func", ["isna", "notna"])
-    def test_isna_returns_copy(self, data_missing, na_func):
-        result = pd.Series(data_missing)
-        expected = result.copy()
-        mask = getattr(result, na_func)()
-        if is_sparse(mask):
-            mask = np.array(mask)
 
-        mask[:] = True
-        self.assert_series_equal(result, expected)
+def command_coverage_analyze_targets_missing(args: CoverageAnalyzeTargetsMissingConfig) -> None:
+    """Identify aggregated coverage in one file missing from another."""
+    host_state = prepare_profiles(args)  # coverage analyze targets missing
 
-    def test_dropna_array(self, data_missing):
-        result = data_missing.dropna()
-        expected = data_missing[[1]]
-        self.assert_extension_array_equal(result, expected)
+    if args.delegate:
+        raise Delegate(host_state=host_state)
 
-    def test_dropna_series(self, data_missing):
-        ser = pd.Series(data_missing)
-        result = ser.dropna()
-        expected = ser.iloc[[1]]
-        self.assert_series_equal(result, expected)
+    from_targets, from_path_arcs, from_path_lines = read_report(args.from_file)
+    to_targets, to_path_arcs, to_path_lines = read_report(args.to_file)
+    target_indexes: TargetIndexes = {}
 
-    def test_dropna_frame(self, data_missing):
-        df = pd.DataFrame({"A": data_missing})
+    if args.only_gaps:
+        arcs = find_gaps(from_path_arcs, from_targets, to_path_arcs, target_indexes, args.only_exists)
+        lines = find_gaps(from_path_lines, from_targets, to_path_lines, target_indexes, args.only_exists)
+    else:
+        arcs = find_missing(from_path_arcs, from_targets, to_path_arcs, to_targets, target_indexes, args.only_exists)
+        lines = find_missing(from_path_lines, from_targets, to_path_lines, to_targets, target_indexes, args.only_exists)
 
-        # defaults
-        result = df.dropna()
-        expected = df.iloc[[1]]
-        self.assert_frame_equal(result, expected)
+    report = make_report(target_indexes, arcs, lines)
+    write_report(args, report, args.output_file)
 
-        # axis = 1
-        result = df.dropna(axis="columns")
-        expected = pd.DataFrame(index=pd.RangeIndex(2), columns=pd.Index([]))
-        self.assert_frame_equal(result, expected)
 
-        # multiple
-        df = pd.DataFrame({"A": data_missing, "B": [1, np.nan]})
-        result = df.dropna()
-        expected = df.iloc[:0]
-        self.assert_frame_equal(result, expected)
+def find_gaps(
+    from_data: IndexedPoints,
+    from_index: list[str],
+    to_data: IndexedPoints,
+    target_indexes: TargetIndexes,
+    only_exists: bool,
+) -> IndexedPoints:
+    """Find gaps in coverage between the from and to data sets."""
+    target_data: IndexedPoints = {}
 
-    def test_fillna_scalar(self, data_missing):
-        valid = data_missing[1]
-        result = data_missing.fillna(valid)
-        expected = data_missing.fillna(valid)
-        self.assert_extension_array_equal(result, expected)
+    for from_path, from_points in from_data.items():
+        if only_exists and not os.path.isfile(to_bytes(from_path)):
+            continue
 
-    def test_fillna_limit_pad(self, data_missing):
-        arr = data_missing.take([1, 0, 0, 0, 1])
-        result = pd.Series(arr).fillna(method="ffill", limit=2)
-        expected = pd.Series(data_missing.take([1, 1, 1, 0, 1]))
-        self.assert_series_equal(result, expected)
+        to_points = to_data.get(from_path, {})
 
-    def test_fillna_limit_backfill(self, data_missing):
-        arr = data_missing.take([1, 0, 0, 0, 1])
-        result = pd.Series(arr).fillna(method="backfill", limit=2)
-        expected = pd.Series(data_missing.take([1, 0, 1, 1, 1]))
-        self.assert_series_equal(result, expected)
+        gaps = set(from_points.keys()) - set(to_points.keys())
 
-    def test_fillna_no_op_returns_copy(self, data):
-        data = data[~data.isna()]
+        if gaps:
+            gap_points = dict((key, value) for key, value in from_points.items() if key in gaps)
+            target_data[from_path] = dict((gap, set(get_target_index(from_index[i], target_indexes) for i in indexes)) for gap, indexes in gap_points.items())
 
-        valid = data[0]
-        result = data.fillna(valid)
-        assert result is not data
-        self.assert_extension_array_equal(result, data)
+    return target_data
 
-        result = data.fillna(method="backfill")
-        assert result is not data
-        self.assert_extension_array_equal(result, data)
 
-    def test_fillna_series(self, data_missing):
-        fill_value = data_missing[1]
-        ser = pd.Series(data_missing)
+def find_missing(
+    from_data: IndexedPoints,
+    from_index: list[str],
+    to_data: IndexedPoints,
+    to_index: list[str],
+    target_indexes: TargetIndexes,
+    only_exists: bool,
+) -> IndexedPoints:
+    """Find coverage in from_data not present in to_data (arcs or lines)."""
+    target_data: IndexedPoints = {}
 
-        result = ser.fillna(fill_value)
-        expected = pd.Series(
-            data_missing._from_sequence(
-                [fill_value, fill_value], dtype=data_missing.dtype
-            )
-        )
-        self.assert_series_equal(result, expected)
+    for from_path, from_points in from_data.items():
+        if only_exists and not os.path.isfile(to_bytes(from_path)):
+            continue
 
-        # Fill with a series
-        result = ser.fillna(expected)
-        self.assert_series_equal(result, expected)
+        to_points = to_data.get(from_path, {})
 
-        # Fill with a series not affecting the missing values
-        result = ser.fillna(ser)
-        self.assert_series_equal(result, ser)
+        for from_point, from_target_indexes in from_points.items():
+            to_target_indexes = to_points.get(from_point, set())
 
-    def test_fillna_series_method(self, data_missing, fillna_method):
-        fill_value = data_missing[1]
+            remaining_targets = set(from_index[i] for i in from_target_indexes) - set(to_index[i] for i in to_target_indexes)
 
-        if fillna_method == "ffill":
-            data_missing = data_missing[::-1]
+            if remaining_targets:
+                target_index = target_data.setdefault(from_path, {}).setdefault(from_point, set())
+                target_index.update(get_target_index(name, target_indexes) for name in remaining_targets)
 
-        result = pd.Series(data_missing).fillna(method=fillna_method)
-        expected = pd.Series(
-            data_missing._from_sequence(
-                [fill_value, fill_value], dtype=data_missing.dtype
-            )
-        )
-
-        self.assert_series_equal(result, expected)
-
-    def test_fillna_frame(self, data_missing):
-        fill_value = data_missing[1]
-
-        result = pd.DataFrame({"A": data_missing, "B": [1, 2]}).fillna(fill_value)
-
-        expected = pd.DataFrame(
-            {
-                "A": data_missing._from_sequence(
-                    [fill_value, fill_value], dtype=data_missing.dtype
-                ),
-                "B": [1, 2],
-            }
-        )
-
-        self.assert_frame_equal(result, expected)
-
-    def test_fillna_fill_other(self, data):
-        result = pd.DataFrame({"A": data, "B": [np.nan] * len(data)}).fillna({"B": 0.0})
-
-        expected = pd.DataFrame({"A": data, "B": [0.0] * len(result)})
-
-        self.assert_frame_equal(result, expected)
-
-    def test_use_inf_as_na_no_effect(self, data_missing):
-        ser = pd.Series(data_missing)
-        expected = ser.isna()
-        with pd.option_context("mode.use_inf_as_na", True):
-            result = ser.isna()
-        self.assert_series_equal(result, expected)
+    return target_data

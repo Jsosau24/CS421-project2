@@ -1,230 +1,150 @@
-import datetime
-from io import BytesIO
-import re
-from warnings import catch_warnings
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-import numpy as np
-import pytest
-
-from pandas import (
-    CategoricalIndex,
-    DataFrame,
-    HDFStore,
-    MultiIndex,
-    _testing as tm,
-    date_range,
-    read_hdf,
-)
-from pandas.tests.io.pytables.common import ensure_clean_store
-
-from pandas.io.pytables import (
-    Term,
-    _maybe_adjust_name,
-)
-
-pytestmark = pytest.mark.single_cpu
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
 
 
-def test_pass_spec_to_storer(setup_path):
-    df = tm.makeDataFrame()
+from units.compat import unittest
+from unittest.mock import mock_open, patch
+from ansible.errors import AnsibleError
+from ansible.parsing.yaml.objects import AnsibleBaseYAMLObject
 
-    with ensure_clean_store(setup_path) as store:
-        store.put("df", df)
-        msg = (
-            "cannot pass a column specification when reading a Fixed format "
-            "store. this store must be selected in its entirety"
+
+class TestErrors(unittest.TestCase):
+
+    def setUp(self):
+        self.message = 'This is the error message'
+        self.unicode_message = 'This is an error with \xf0\x9f\x98\xa8 in it'
+
+        self.obj = AnsibleBaseYAMLObject()
+
+    def test_basic_error(self):
+        e = AnsibleError(self.message)
+        self.assertEqual(e.message, self.message)
+        self.assertEqual(repr(e), self.message)
+
+    def test_basic_unicode_error(self):
+        e = AnsibleError(self.unicode_message)
+        self.assertEqual(e.message, self.unicode_message)
+        self.assertEqual(repr(e), self.unicode_message)
+
+    @patch.object(AnsibleError, '_get_error_lines_from_file')
+    def test_error_with_kv(self, mock_method):
+        ''' This tests a task with both YAML and k=v syntax
+
+        - lineinfile: line=foo path=bar
+            line: foo
+
+        An accurate error message and position indicator are expected.
+
+        _get_error_lines_from_file() returns (target_line, prev_line)
+        '''
+
+        self.obj.ansible_pos = ('foo.yml', 2, 1)
+
+        mock_method.return_value = ['    line: foo\n', '- lineinfile: line=foo path=bar\n']
+
+        e = AnsibleError(self.message, self.obj)
+        self.assertEqual(
+            e.message,
+            ("This is the error message\n\nThe error appears to be in 'foo.yml': line 1, column 19, but may\nbe elsewhere in the "
+             "file depending on the exact syntax problem.\n\nThe offending line appears to be:\n\n- lineinfile: line=foo path=bar\n"
+             "                  ^ here\n\n"
+             "There appears to be both 'k=v' shorthand syntax and YAML in this task. Only one syntax may be used.\n")
         )
-        with pytest.raises(TypeError, match=msg):
-            store.select("df", columns=["A"])
-        msg = (
-            "cannot pass a where specification when reading from a Fixed "
-            "format store. this store must be selected in its entirety"
+
+    @patch.object(AnsibleError, '_get_error_lines_from_file')
+    def test_error_with_object(self, mock_method):
+        self.obj.ansible_pos = ('foo.yml', 1, 1)
+
+        mock_method.return_value = ('this is line 1\n', '')
+        e = AnsibleError(self.message, self.obj)
+
+        self.assertEqual(
+            e.message,
+            ("This is the error message\n\nThe error appears to be in 'foo.yml': line 1, column 1, but may\nbe elsewhere in the file depending on the "
+             "exact syntax problem.\n\nThe offending line appears to be:\n\n\nthis is line 1\n^ here\n")
         )
-        with pytest.raises(TypeError, match=msg):
-            store.select("df", where=[("columns=A")])
 
+    def test_get_error_lines_from_file(self):
+        m = mock_open()
+        m.return_value.readlines.return_value = ['this is line 1\n']
 
-def test_table_index_incompatible_dtypes(setup_path):
-    df1 = DataFrame({"a": [1, 2, 3]})
-    df2 = DataFrame({"a": [4, 5, 6]}, index=date_range("1/1/2000", periods=3))
-
-    with ensure_clean_store(setup_path) as store:
-        store.put("frame", df1, format="table")
-        msg = re.escape("incompatible kind in col [integer - datetime64]")
-        with pytest.raises(TypeError, match=msg):
-            store.put("frame", df2, format="table", append=True)
-
-
-def test_unimplemented_dtypes_table_columns(setup_path):
-    with ensure_clean_store(setup_path) as store:
-        dtypes = [("date", datetime.date(2001, 1, 2))]
-
-        # currently not supported dtypes ####
-        for n, f in dtypes:
-            df = tm.makeDataFrame()
-            df[n] = f
-            msg = re.escape(f"[{n}] is not implemented as a table column")
-            with pytest.raises(TypeError, match=msg):
-                store.append(f"df1_{n}", df)
-
-    # frame
-    df = tm.makeDataFrame()
-    df["obj1"] = "foo"
-    df["obj2"] = "bar"
-    df["datetime1"] = datetime.date(2001, 1, 2)
-    df = df._consolidate()
-
-    with ensure_clean_store(setup_path) as store:
-        # this fails because we have a date in the object block......
-        msg = re.escape(
-            """Cannot serialize the column [datetime1]
-because its data contents are not [string] but [date] object dtype"""
-        )
-        with pytest.raises(TypeError, match=msg):
-            store.append("df_unimplemented", df)
-
-
-def test_invalid_terms(tmp_path, setup_path):
-    with ensure_clean_store(setup_path) as store:
-        with catch_warnings(record=True):
-            df = tm.makeTimeDataFrame()
-            df["string"] = "foo"
-            df.loc[df.index[0:4], "string"] = "bar"
-
-            store.put("df", df, format="table")
-
-            # some invalid terms
-            msg = re.escape(
-                "__init__() missing 1 required positional argument: 'where'"
+        with patch('builtins.open', m):
+            # this line will be found in the file
+            self.obj.ansible_pos = ('foo.yml', 1, 1)
+            e = AnsibleError(self.message, self.obj)
+            self.assertEqual(
+                e.message,
+                ("This is the error message\n\nThe error appears to be in 'foo.yml': line 1, column 1, but may\nbe elsewhere in the file depending on "
+                 "the exact syntax problem.\n\nThe offending line appears to be:\n\n\nthis is line 1\n^ here\n")
             )
-            with pytest.raises(TypeError, match=msg):
-                Term()
 
-            # more invalid
-            msg = re.escape(
-                "cannot process expression [df.index[3]], "
-                "[2000-01-06 00:00:00] is not a valid condition"
+            with patch('ansible.errors.to_text', side_effect=IndexError('Raised intentionally')):
+                # raise an IndexError
+                self.obj.ansible_pos = ('foo.yml', 2, 1)
+                e = AnsibleError(self.message, self.obj)
+                self.assertEqual(
+                    e.message,
+                    ("This is the error message\n\nThe error appears to be in 'foo.yml': line 2, column 1, but may\nbe elsewhere in the file depending on "
+                     "the exact syntax problem.\n\n(specified line no longer in file, maybe it changed?)")
+                )
+
+        m = mock_open()
+        m.return_value.readlines.return_value = ['this line has unicode \xf0\x9f\x98\xa8 in it!\n']
+
+        with patch('builtins.open', m):
+            # this line will be found in the file
+            self.obj.ansible_pos = ('foo.yml', 1, 1)
+            e = AnsibleError(self.unicode_message, self.obj)
+            self.assertEqual(
+                e.message,
+                ("This is an error with \xf0\x9f\x98\xa8 in it\n\nThe error appears to be in 'foo.yml': line 1, column 1, but may\nbe elsewhere in the "
+                 "file depending on the exact syntax problem.\n\nThe offending line appears to be:\n\n\nthis line has unicode \xf0\x9f\x98\xa8 in it!\n^ "
+                 "here\n")
             )
-            with pytest.raises(ValueError, match=msg):
-                store.select("df", "df.index[3]")
 
-            msg = "invalid syntax"
-            with pytest.raises(SyntaxError, match=msg):
-                store.select("df", "index>")
+    def test_get_error_lines_error_in_last_line(self):
+        m = mock_open()
+        m.return_value.readlines.return_value = ['this is line 1\n', 'this is line 2\n', 'this is line 3\n']
 
-    # from the docs
-    path = tmp_path / setup_path
-    dfq = DataFrame(
-        np.random.randn(10, 4),
-        columns=list("ABCD"),
-        index=date_range("20130101", periods=10),
-    )
-    dfq.to_hdf(path, "dfq", format="table", data_columns=True)
-
-    # check ok
-    read_hdf(path, "dfq", where="index>Timestamp('20130104') & columns=['A', 'B']")
-    read_hdf(path, "dfq", where="A>0 or C>0")
-
-    # catch the invalid reference
-    path = tmp_path / setup_path
-    dfq = DataFrame(
-        np.random.randn(10, 4),
-        columns=list("ABCD"),
-        index=date_range("20130101", periods=10),
-    )
-    dfq.to_hdf(path, "dfq", format="table")
-
-    msg = (
-        r"The passed where expression: A>0 or C>0\n\s*"
-        r"contains an invalid variable reference\n\s*"
-        r"all of the variable references must be a reference to\n\s*"
-        r"an axis \(e.g. 'index' or 'columns'\), or a data_column\n\s*"
-        r"The currently defined references are: index,columns\n"
-    )
-    with pytest.raises(ValueError, match=msg):
-        read_hdf(path, "dfq", where="A>0 or C>0")
-
-
-def test_append_with_diff_col_name_types_raises_value_error(setup_path):
-    df = DataFrame(np.random.randn(10, 1))
-    df2 = DataFrame({"a": np.random.randn(10)})
-    df3 = DataFrame({(1, 2): np.random.randn(10)})
-    df4 = DataFrame({("1", 2): np.random.randn(10)})
-    df5 = DataFrame({("1", 2, object): np.random.randn(10)})
-
-    with ensure_clean_store(setup_path) as store:
-        name = f"df_{tm.rands(10)}"
-        store.append(name, df)
-
-        for d in (df2, df3, df4, df5):
-            msg = re.escape(
-                "cannot match existing table structure for [0] on appending data"
+        with patch('builtins.open', m):
+            # If the error occurs in the last line of the file, use the correct index to get the line
+            # and avoid the IndexError
+            self.obj.ansible_pos = ('foo.yml', 4, 1)
+            e = AnsibleError(self.message, self.obj)
+            self.assertEqual(
+                e.message,
+                ("This is the error message\n\nThe error appears to be in 'foo.yml': line 4, column 1, but may\nbe elsewhere in the file depending on "
+                 "the exact syntax problem.\n\nThe offending line appears to be:\n\nthis is line 2\nthis is line 3\n^ here\n")
             )
-            with pytest.raises(ValueError, match=msg):
-                store.append(name, d)
 
+    def test_get_error_lines_error_empty_lines_around_error(self):
+        """Test that trailing whitespace after the error is removed"""
+        m = mock_open()
+        m.return_value.readlines.return_value = ['this is line 1\n', 'this is line 2\n', 'this is line 3\n', '  \n', '   \n', ' ']
 
-def test_invalid_complib(setup_path):
-    df = DataFrame(np.random.rand(4, 5), index=list("abcd"), columns=list("ABCDE"))
-    with tm.ensure_clean(setup_path) as path:
-        msg = r"complib only supports \[.*\] compression."
-        with pytest.raises(ValueError, match=msg):
-            df.to_hdf(path, "df", complib="foolib")
-
-
-@pytest.mark.parametrize(
-    "idx",
-    [
-        date_range("2019", freq="D", periods=3, tz="UTC"),
-        CategoricalIndex(list("abc")),
-    ],
-)
-def test_to_hdf_multiindex_extension_dtype(idx, tmp_path, setup_path):
-    # GH 7775
-    mi = MultiIndex.from_arrays([idx, idx])
-    df = DataFrame(0, index=mi, columns=["a"])
-    path = tmp_path / setup_path
-    with pytest.raises(NotImplementedError, match="Saving a MultiIndex"):
-        df.to_hdf(path, "df")
-
-
-def test_unsuppored_hdf_file_error(datapath):
-    # GH 9539
-    data_path = datapath("io", "data", "legacy_hdf/incompatible_dataset.h5")
-    message = (
-        r"Dataset\(s\) incompatible with Pandas data types, "
-        "not table, or no datasets found in HDF5 file."
-    )
-
-    with pytest.raises(ValueError, match=message):
-        read_hdf(data_path)
-
-
-def test_read_hdf_errors(setup_path, tmp_path):
-    df = DataFrame(np.random.rand(4, 5), index=list("abcd"), columns=list("ABCDE"))
-
-    path = tmp_path / setup_path
-    msg = r"File [\S]* does not exist"
-    with pytest.raises(OSError, match=msg):
-        read_hdf(path, "key")
-
-    df.to_hdf(path, "df")
-    store = HDFStore(path, mode="r")
-    store.close()
-
-    msg = "The HDFStore must be open for reading."
-    with pytest.raises(OSError, match=msg):
-        read_hdf(store, "df")
-
-
-def test_read_hdf_generic_buffer_errors():
-    msg = "Support for generic buffers has not been implemented."
-    with pytest.raises(NotImplementedError, match=msg):
-        read_hdf(BytesIO(b""), "df")
-
-
-@pytest.mark.parametrize("bad_version", [(1, 2), (1,), [], "12", "123"])
-def test_maybe_adjust_name_bad_version_raises(bad_version):
-    msg = "Version is incorrect, expected sequence of 3 integers"
-    with pytest.raises(ValueError, match=msg):
-        _maybe_adjust_name("values_block_0", version=bad_version)
+        with patch('builtins.open', m):
+            self.obj.ansible_pos = ('foo.yml', 5, 1)
+            e = AnsibleError(self.message, self.obj)
+            self.assertEqual(
+                e.message,
+                ("This is the error message\n\nThe error appears to be in 'foo.yml': line 5, column 1, but may\nbe elsewhere in the file depending on "
+                 "the exact syntax problem.\n\nThe offending line appears to be:\n\nthis is line 2\nthis is line 3\n^ here\n")
+            )

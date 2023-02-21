@@ -1,779 +1,925 @@
-from copy import copy
-from itertools import chain
-import warnings
-import string
-import timeit
+import copy
+import filecmp
+import os
+import tarfile
+import zipfile
+from collections import deque
+from io import BytesIO
 
 import pytest
-import numpy as np
-import scipy.sparse as sp
 
-from sklearn.utils._testing import (
-    assert_array_equal,
-    assert_allclose_dense_sparse,
-    assert_no_warnings,
-    _convert_container,
+from requests import compat
+from requests._internal_utils import unicode_is_ascii
+from requests.cookies import RequestsCookieJar
+from requests.structures import CaseInsensitiveDict
+from requests.utils import (
+    _parse_content_type_header,
+    add_dict_to_cookiejar,
+    address_in_network,
+    dotted_netmask,
+    extract_zipped_paths,
+    get_auth_from_url,
+    get_encoding_from_headers,
+    get_encodings_from_content,
+    get_environ_proxies,
+    guess_filename,
+    guess_json_utf,
+    is_ipv4_address,
+    is_valid_cidr,
+    iter_slices,
+    parse_dict_header,
+    parse_header_links,
+    prepend_scheme_if_needed,
+    requote_uri,
+    select_proxy,
+    set_environ,
+    should_bypass_proxies,
+    super_len,
+    to_key_val_list,
+    to_native_string,
+    unquote_header_value,
+    unquote_unreserved,
+    urldefragauth,
 )
-from sklearn.utils import check_random_state
-from sklearn.utils import _determine_key_type
-from sklearn.utils import deprecated
-from sklearn.utils import gen_batches
-from sklearn.utils import _get_column_indices
-from sklearn.utils import resample
-from sklearn.utils import safe_mask
-from sklearn.utils import column_or_1d
-from sklearn.utils import _safe_indexing
-from sklearn.utils import _safe_assign
-from sklearn.utils import shuffle
-from sklearn.utils import gen_even_slices
-from sklearn.utils import _message_with_time, _print_elapsed_time
-from sklearn.utils import get_chunk_n_rows
-from sklearn.utils import is_scalar_nan
-from sklearn.utils import _to_object_array
-from sklearn.utils import _approximate_mode
-from sklearn.utils._mocking import MockDataFrame
-from sklearn import config_context
 
-# toy array
-X_toy = np.arange(9).reshape((3, 3))
+from .compat import StringIO, cStringIO
 
 
-def test_make_rng():
-    # Check the check_random_state utility function behavior
-    assert check_random_state(None) is np.random.mtrand._rand
-    assert check_random_state(np.random) is np.random.mtrand._rand
-
-    rng_42 = np.random.RandomState(42)
-    assert check_random_state(42).randint(100) == rng_42.randint(100)
-
-    rng_42 = np.random.RandomState(42)
-    assert check_random_state(rng_42) is rng_42
-
-    rng_42 = np.random.RandomState(42)
-    assert check_random_state(43).randint(100) != rng_42.randint(100)
-
-    with pytest.raises(ValueError):
-        check_random_state("some invalid seed")
-
-
-def test_gen_batches():
-    # Make sure gen_batches errors on invalid batch_size
-
-    assert_array_equal(list(gen_batches(4, 2)), [slice(0, 2, None), slice(2, 4, None)])
-    msg_zero = "gen_batches got batch_size=0, must be positive"
-    with pytest.raises(ValueError, match=msg_zero):
-        next(gen_batches(4, 0))
-
-    msg_float = "gen_batches got batch_size=0.5, must be an integer"
-    with pytest.raises(TypeError, match=msg_float):
-        next(gen_batches(4, 0.5))
-
-
-def test_deprecated():
-    # Test whether the deprecated decorator issues appropriate warnings
-    # Copied almost verbatim from https://docs.python.org/library/warnings.html
-
-    # First a function...
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-
-        @deprecated()
-        def ham():
-            return "spam"
-
-        spam = ham()
-
-        assert spam == "spam"  # function must remain usable
-
-        assert len(w) == 1
-        assert issubclass(w[0].category, FutureWarning)
-        assert "deprecated" in str(w[0].message).lower()
-
-    # ... then a class.
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-
-        @deprecated("don't use this")
-        class Ham:
-            SPAM = 1
-
-        ham = Ham()
-
-        assert hasattr(ham, "SPAM")
-
-        assert len(w) == 1
-        assert issubclass(w[0].category, FutureWarning)
-        assert "deprecated" in str(w[0].message).lower()
-
-
-def test_resample():
-    # Border case not worth mentioning in doctests
-    assert resample() is None
-
-    # Check that invalid arguments yield ValueError
-    with pytest.raises(ValueError):
-        resample([0], [0, 1])
-    with pytest.raises(ValueError):
-        resample([0, 1], [0, 1], replace=False, n_samples=3)
-
-    # Issue:6581, n_samples can be more when replace is True (default).
-    assert len(resample([1, 2], n_samples=5)) == 5
-
-
-def test_resample_stratified():
-    # Make sure resample can stratify
-    rng = np.random.RandomState(0)
-    n_samples = 100
-    p = 0.9
-    X = rng.normal(size=(n_samples, 1))
-    y = rng.binomial(1, p, size=n_samples)
-
-    _, y_not_stratified = resample(X, y, n_samples=10, random_state=0, stratify=None)
-    assert np.all(y_not_stratified == 1)
-
-    _, y_stratified = resample(X, y, n_samples=10, random_state=0, stratify=y)
-    assert not np.all(y_stratified == 1)
-    assert np.sum(y_stratified) == 9  # all 1s, one 0
-
-
-def test_resample_stratified_replace():
-    # Make sure stratified resampling supports the replace parameter
-    rng = np.random.RandomState(0)
-    n_samples = 100
-    X = rng.normal(size=(n_samples, 1))
-    y = rng.randint(0, 2, size=n_samples)
-
-    X_replace, _ = resample(
-        X, y, replace=True, n_samples=50, random_state=rng, stratify=y
+class TestSuperLen:
+    @pytest.mark.parametrize(
+        "stream, value",
+        (
+            (StringIO.StringIO, "Test"),
+            (BytesIO, b"Test"),
+            pytest.param(
+                cStringIO, "Test", marks=pytest.mark.skipif("cStringIO is None")
+            ),
+        ),
     )
-    X_no_replace, _ = resample(
-        X, y, replace=False, n_samples=50, random_state=rng, stratify=y
+    def test_io_streams(self, stream, value):
+        """Ensures that we properly deal with different kinds of IO streams."""
+        assert super_len(stream()) == 0
+        assert super_len(stream(value)) == 4
+
+    def test_super_len_correctly_calculates_len_of_partially_read_file(self):
+        """Ensure that we handle partially consumed file like objects."""
+        s = StringIO.StringIO()
+        s.write("foobarbogus")
+        assert super_len(s) == 0
+
+    @pytest.mark.parametrize("error", [IOError, OSError])
+    def test_super_len_handles_files_raising_weird_errors_in_tell(self, error):
+        """If tell() raises errors, assume the cursor is at position zero."""
+
+        class BoomFile:
+            def __len__(self):
+                return 5
+
+            def tell(self):
+                raise error()
+
+        assert super_len(BoomFile()) == 0
+
+    @pytest.mark.parametrize("error", [IOError, OSError])
+    def test_super_len_tell_ioerror(self, error):
+        """Ensure that if tell gives an IOError super_len doesn't fail"""
+
+        class NoLenBoomFile:
+            def tell(self):
+                raise error()
+
+            def seek(self, offset, whence):
+                pass
+
+        assert super_len(NoLenBoomFile()) == 0
+
+    def test_string(self):
+        assert super_len("Test") == 4
+
+    @pytest.mark.parametrize(
+        "mode, warnings_num",
+        (
+            ("r", 1),
+            ("rb", 0),
+        ),
     )
-    assert np.unique(X_replace).shape[0] < 50
-    assert np.unique(X_no_replace).shape[0] == 50
+    def test_file(self, tmpdir, mode, warnings_num, recwarn):
+        file_obj = tmpdir.join("test.txt")
+        file_obj.write("Test")
+        with file_obj.open(mode) as fd:
+            assert super_len(fd) == 4
+        assert len(recwarn) == warnings_num
 
-    # make sure n_samples can be greater than X.shape[0] if we sample with
-    # replacement
-    X_replace, _ = resample(
-        X, y, replace=True, n_samples=1000, random_state=rng, stratify=y
+    def test_tarfile_member(self, tmpdir):
+        file_obj = tmpdir.join("test.txt")
+        file_obj.write("Test")
+
+        tar_obj = str(tmpdir.join("test.tar"))
+        with tarfile.open(tar_obj, "w") as tar:
+            tar.add(str(file_obj), arcname="test.txt")
+
+        with tarfile.open(tar_obj) as tar:
+            member = tar.extractfile("test.txt")
+            assert super_len(member) == 4
+
+    def test_super_len_with__len__(self):
+        foo = [1, 2, 3, 4]
+        len_foo = super_len(foo)
+        assert len_foo == 4
+
+    def test_super_len_with_no__len__(self):
+        class LenFile:
+            def __init__(self):
+                self.len = 5
+
+        assert super_len(LenFile()) == 5
+
+    def test_super_len_with_tell(self):
+        foo = StringIO.StringIO("12345")
+        assert super_len(foo) == 5
+        foo.read(2)
+        assert super_len(foo) == 3
+
+    def test_super_len_with_fileno(self):
+        with open(__file__, "rb") as f:
+            length = super_len(f)
+            file_data = f.read()
+        assert length == len(file_data)
+
+    def test_super_len_with_no_matches(self):
+        """Ensure that objects without any length methods default to 0"""
+        assert super_len(object()) == 0
+
+
+class TestToKeyValList:
+    @pytest.mark.parametrize(
+        "value, expected",
+        (
+            ([("key", "val")], [("key", "val")]),
+            ((("key", "val"),), [("key", "val")]),
+            ({"key": "val"}, [("key", "val")]),
+            (None, None),
+        ),
     )
-    assert X_replace.shape[0] == 1000
-    assert np.unique(X_replace).shape[0] == 100
+    def test_valid(self, value, expected):
+        assert to_key_val_list(value) == expected
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            to_key_val_list("string")
 
 
-def test_resample_stratify_2dy():
-    # Make sure y can be 2d when stratifying
-    rng = np.random.RandomState(0)
-    n_samples = 100
-    X = rng.normal(size=(n_samples, 1))
-    y = rng.randint(0, 2, size=(n_samples, 2))
-    X, y = resample(X, y, n_samples=50, random_state=rng, stratify=y)
-    assert y.ndim == 2
-
-
-def test_resample_stratify_sparse_error():
-    # resample must be ndarray
-    rng = np.random.RandomState(0)
-    n_samples = 100
-    X = rng.normal(size=(n_samples, 2))
-    y = rng.randint(0, 2, size=n_samples)
-    stratify = sp.csr_matrix(y)
-    with pytest.raises(TypeError, match="A sparse matrix was passed"):
-        X, y = resample(X, y, n_samples=50, random_state=rng, stratify=stratify)
-
-
-def test_safe_mask():
-    random_state = check_random_state(0)
-    X = random_state.rand(5, 4)
-    X_csr = sp.csr_matrix(X)
-    mask = [False, False, True, True, True]
-
-    mask = safe_mask(X, mask)
-    assert X[mask].shape[0] == 3
-
-    mask = safe_mask(X_csr, mask)
-    assert X_csr[mask].shape[0] == 3
-
-
-def test_column_or_1d():
-    EXAMPLES = [
-        ("binary", ["spam", "egg", "spam"]),
-        ("binary", [0, 1, 0, 1]),
-        ("continuous", np.arange(10) / 20.0),
-        ("multiclass", [1, 2, 3]),
-        ("multiclass", [0, 1, 2, 2, 0]),
-        ("multiclass", [[1], [2], [3]]),
-        ("multilabel-indicator", [[0, 1, 0], [0, 0, 1]]),
-        ("multiclass-multioutput", [[1, 2, 3]]),
-        ("multiclass-multioutput", [[1, 1], [2, 2], [3, 1]]),
-        ("multiclass-multioutput", [[5, 1], [4, 2], [3, 1]]),
-        ("multiclass-multioutput", [[1, 2, 3]]),
-        ("continuous-multioutput", np.arange(30).reshape((-1, 3))),
-    ]
-
-    for y_type, y in EXAMPLES:
-        if y_type in ["binary", "multiclass", "continuous"]:
-            assert_array_equal(column_or_1d(y), np.ravel(y))
-        else:
-            with pytest.raises(ValueError):
-                column_or_1d(y)
-
-
-@pytest.mark.parametrize(
-    "key, dtype",
-    [
-        (0, "int"),
-        ("0", "str"),
-        (True, "bool"),
-        (np.bool_(True), "bool"),
-        ([0, 1, 2], "int"),
-        (["0", "1", "2"], "str"),
-        ((0, 1, 2), "int"),
-        (("0", "1", "2"), "str"),
-        (slice(None, None), None),
-        (slice(0, 2), "int"),
-        (np.array([0, 1, 2], dtype=np.int32), "int"),
-        (np.array([0, 1, 2], dtype=np.int64), "int"),
-        (np.array([0, 1, 2], dtype=np.uint8), "int"),
-        ([True, False], "bool"),
-        ((True, False), "bool"),
-        (np.array([True, False]), "bool"),
-        ("col_0", "str"),
-        (["col_0", "col_1", "col_2"], "str"),
-        (("col_0", "col_1", "col_2"), "str"),
-        (slice("begin", "end"), "str"),
-        (np.array(["col_0", "col_1", "col_2"]), "str"),
-        (np.array(["col_0", "col_1", "col_2"], dtype=object), "str"),
-    ],
-)
-def test_determine_key_type(key, dtype):
-    assert _determine_key_type(key) == dtype
-
-
-def test_determine_key_type_error():
-    with pytest.raises(ValueError, match="No valid specification of the"):
-        _determine_key_type(1.0)
-
-
-def test_determine_key_type_slice_error():
-    with pytest.raises(TypeError, match="Only array-like or scalar are"):
-        _determine_key_type(slice(0, 2, 1), accept_slice=False)
-
-
-@pytest.mark.parametrize("array_type", ["list", "array", "sparse", "dataframe"])
-@pytest.mark.parametrize("indices_type", ["list", "tuple", "array", "series", "slice"])
-def test_safe_indexing_2d_container_axis_0(array_type, indices_type):
-    indices = [1, 2]
-    if indices_type == "slice" and isinstance(indices[1], int):
-        indices[1] += 1
-    array = _convert_container([[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type)
-    indices = _convert_container(indices, indices_type)
-    subset = _safe_indexing(array, indices, axis=0)
-    assert_allclose_dense_sparse(
-        subset, _convert_container([[4, 5, 6], [7, 8, 9]], array_type)
+class TestUnquoteHeaderValue:
+    @pytest.mark.parametrize(
+        "value, expected",
+        (
+            (None, None),
+            ("Test", "Test"),
+            ('"Test"', "Test"),
+            ('"Test\\\\"', "Test\\"),
+            ('"\\\\Comp\\Res"', "\\Comp\\Res"),
+        ),
     )
+    def test_valid(self, value, expected):
+        assert unquote_header_value(value) == expected
 
+    def test_is_filename(self):
+        assert unquote_header_value('"\\\\Comp\\Res"', True) == "\\\\Comp\\Res"
 
-@pytest.mark.parametrize("array_type", ["list", "array", "series"])
-@pytest.mark.parametrize("indices_type", ["list", "tuple", "array", "series", "slice"])
-def test_safe_indexing_1d_container(array_type, indices_type):
-    indices = [1, 2]
-    if indices_type == "slice" and isinstance(indices[1], int):
-        indices[1] += 1
-    array = _convert_container([1, 2, 3, 4, 5, 6, 7, 8, 9], array_type)
-    indices = _convert_container(indices, indices_type)
-    subset = _safe_indexing(array, indices, axis=0)
-    assert_allclose_dense_sparse(subset, _convert_container([2, 3], array_type))
 
-
-@pytest.mark.parametrize("array_type", ["array", "sparse", "dataframe"])
-@pytest.mark.parametrize("indices_type", ["list", "tuple", "array", "series", "slice"])
-@pytest.mark.parametrize("indices", [[1, 2], ["col_1", "col_2"]])
-def test_safe_indexing_2d_container_axis_1(array_type, indices_type, indices):
-    # validation of the indices
-    # we make a copy because indices is mutable and shared between tests
-    indices_converted = copy(indices)
-    if indices_type == "slice" and isinstance(indices[1], int):
-        indices_converted[1] += 1
-
-    columns_name = ["col_0", "col_1", "col_2"]
-    array = _convert_container(
-        [[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type, columns_name
-    )
-    indices_converted = _convert_container(indices_converted, indices_type)
-
-    if isinstance(indices[0], str) and array_type != "dataframe":
-        err_msg = (
-            "Specifying the columns using strings is only supported "
-            "for pandas DataFrames"
-        )
-        with pytest.raises(ValueError, match=err_msg):
-            _safe_indexing(array, indices_converted, axis=1)
-    else:
-        subset = _safe_indexing(array, indices_converted, axis=1)
-        assert_allclose_dense_sparse(
-            subset, _convert_container([[2, 3], [5, 6], [8, 9]], array_type)
-        )
-
-
-@pytest.mark.parametrize("array_read_only", [True, False])
-@pytest.mark.parametrize("indices_read_only", [True, False])
-@pytest.mark.parametrize("array_type", ["array", "sparse", "dataframe"])
-@pytest.mark.parametrize("indices_type", ["array", "series"])
-@pytest.mark.parametrize(
-    "axis, expected_array", [(0, [[4, 5, 6], [7, 8, 9]]), (1, [[2, 3], [5, 6], [8, 9]])]
-)
-def test_safe_indexing_2d_read_only_axis_1(
-    array_read_only, indices_read_only, array_type, indices_type, axis, expected_array
-):
-    array = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    if array_read_only:
-        array.setflags(write=False)
-    array = _convert_container(array, array_type)
-    indices = np.array([1, 2])
-    if indices_read_only:
-        indices.setflags(write=False)
-    indices = _convert_container(indices, indices_type)
-    subset = _safe_indexing(array, indices, axis=axis)
-    assert_allclose_dense_sparse(subset, _convert_container(expected_array, array_type))
-
-
-@pytest.mark.parametrize("array_type", ["list", "array", "series"])
-@pytest.mark.parametrize("indices_type", ["list", "tuple", "array", "series"])
-def test_safe_indexing_1d_container_mask(array_type, indices_type):
-    indices = [False] + [True] * 2 + [False] * 6
-    array = _convert_container([1, 2, 3, 4, 5, 6, 7, 8, 9], array_type)
-    indices = _convert_container(indices, indices_type)
-    subset = _safe_indexing(array, indices, axis=0)
-    assert_allclose_dense_sparse(subset, _convert_container([2, 3], array_type))
-
-
-@pytest.mark.parametrize("array_type", ["array", "sparse", "dataframe"])
-@pytest.mark.parametrize("indices_type", ["list", "tuple", "array", "series"])
-@pytest.mark.parametrize(
-    "axis, expected_subset",
-    [(0, [[4, 5, 6], [7, 8, 9]]), (1, [[2, 3], [5, 6], [8, 9]])],
-)
-def test_safe_indexing_2d_mask(array_type, indices_type, axis, expected_subset):
-    columns_name = ["col_0", "col_1", "col_2"]
-    array = _convert_container(
-        [[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type, columns_name
-    )
-    indices = [False, True, True]
-    indices = _convert_container(indices, indices_type)
-
-    subset = _safe_indexing(array, indices, axis=axis)
-    assert_allclose_dense_sparse(
-        subset, _convert_container(expected_subset, array_type)
-    )
-
-
-@pytest.mark.parametrize(
-    "array_type, expected_output_type",
-    [
-        ("list", "list"),
-        ("array", "array"),
-        ("sparse", "sparse"),
-        ("dataframe", "series"),
-    ],
-)
-def test_safe_indexing_2d_scalar_axis_0(array_type, expected_output_type):
-    array = _convert_container([[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type)
-    indices = 2
-    subset = _safe_indexing(array, indices, axis=0)
-    expected_array = _convert_container([7, 8, 9], expected_output_type)
-    assert_allclose_dense_sparse(subset, expected_array)
-
-
-@pytest.mark.parametrize("array_type", ["list", "array", "series"])
-def test_safe_indexing_1d_scalar(array_type):
-    array = _convert_container([1, 2, 3, 4, 5, 6, 7, 8, 9], array_type)
-    indices = 2
-    subset = _safe_indexing(array, indices, axis=0)
-    assert subset == 3
-
-
-@pytest.mark.parametrize(
-    "array_type, expected_output_type",
-    [("array", "array"), ("sparse", "sparse"), ("dataframe", "series")],
-)
-@pytest.mark.parametrize("indices", [2, "col_2"])
-def test_safe_indexing_2d_scalar_axis_1(array_type, expected_output_type, indices):
-    columns_name = ["col_0", "col_1", "col_2"]
-    array = _convert_container(
-        [[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type, columns_name
-    )
-
-    if isinstance(indices, str) and array_type != "dataframe":
-        err_msg = (
-            "Specifying the columns using strings is only supported "
-            "for pandas DataFrames"
-        )
-        with pytest.raises(ValueError, match=err_msg):
-            _safe_indexing(array, indices, axis=1)
-    else:
-        subset = _safe_indexing(array, indices, axis=1)
-        expected_output = [3, 6, 9]
-        if expected_output_type == "sparse":
-            # sparse matrix are keeping the 2D shape
-            expected_output = [[3], [6], [9]]
-        expected_array = _convert_container(expected_output, expected_output_type)
-        assert_allclose_dense_sparse(subset, expected_array)
-
-
-@pytest.mark.parametrize("array_type", ["list", "array", "sparse"])
-def test_safe_indexing_None_axis_0(array_type):
-    X = _convert_container([[1, 2, 3], [4, 5, 6], [7, 8, 9]], array_type)
-    X_subset = _safe_indexing(X, None, axis=0)
-    assert_allclose_dense_sparse(X_subset, X)
-
-
-def test_safe_indexing_pandas_no_matching_cols_error():
-    pd = pytest.importorskip("pandas")
-    err_msg = "No valid specification of the columns."
-    X = pd.DataFrame(X_toy)
-    with pytest.raises(ValueError, match=err_msg):
-        _safe_indexing(X, [1.0], axis=1)
-
-
-@pytest.mark.parametrize("axis", [None, 3])
-def test_safe_indexing_error_axis(axis):
-    with pytest.raises(ValueError, match="'axis' should be either 0"):
-        _safe_indexing(X_toy, [0, 1], axis=axis)
-
-
-@pytest.mark.parametrize("X_constructor", ["array", "series"])
-def test_safe_indexing_1d_array_error(X_constructor):
-    # check that we are raising an error if the array-like passed is 1D and
-    # we try to index on the 2nd dimension
-    X = list(range(5))
-    if X_constructor == "array":
-        X_constructor = np.asarray(X)
-    elif X_constructor == "series":
-        pd = pytest.importorskip("pandas")
-        X_constructor = pd.Series(X)
-
-    err_msg = "'X' should be a 2D NumPy array, 2D sparse matrix or pandas"
-    with pytest.raises(ValueError, match=err_msg):
-        _safe_indexing(X_constructor, [0, 1], axis=1)
-
-
-def test_safe_indexing_container_axis_0_unsupported_type():
-    indices = ["col_1", "col_2"]
-    array = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
-    err_msg = "String indexing is not supported with 'axis=0'"
-    with pytest.raises(ValueError, match=err_msg):
-        _safe_indexing(array, indices, axis=0)
-
-
-def test_safe_indexing_pandas_no_settingwithcopy_warning():
-    # Using safe_indexing with an array-like indexer gives a copy of the
-    # DataFrame -> ensure it doesn't raise a warning if modified
-    pd = pytest.importorskip("pandas")
-
-    X = pd.DataFrame({"a": [1, 2, 3], "b": [3, 4, 5]})
-    subset = _safe_indexing(X, [0, 1], axis=0)
-    if hasattr(pd.errors, "SettingWithCopyWarning"):
-        SettingWithCopyWarning = pd.errors.SettingWithCopyWarning
-    else:
-        # backward compatibility for pandas < 1.5
-        SettingWithCopyWarning = pd.core.common.SettingWithCopyWarning
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", SettingWithCopyWarning)
-        subset.iloc[0, 0] = 10
-    # The original dataframe is unaffected by the assignment on the subset:
-    assert X.iloc[0, 0] == 1
-
-
-@pytest.mark.parametrize(
-    "key, err_msg",
-    [
-        (10, r"all features must be in \[0, 2\]"),
-        ("whatever", "A given column is not a column of the dataframe"),
-    ],
-)
-def test_get_column_indices_error(key, err_msg):
-    pd = pytest.importorskip("pandas")
-    X_df = pd.DataFrame(X_toy, columns=["col_0", "col_1", "col_2"])
-
-    with pytest.raises(ValueError, match=err_msg):
-        _get_column_indices(X_df, key)
-
-
-@pytest.mark.parametrize(
-    "key", [["col1"], ["col2"], ["col1", "col2"], ["col1", "col3"], ["col2", "col3"]]
-)
-def test_get_column_indices_pandas_nonunique_columns_error(key):
-    pd = pytest.importorskip("pandas")
-    toy = np.zeros((1, 5), dtype=int)
-    columns = ["col1", "col1", "col2", "col3", "col2"]
-    X = pd.DataFrame(toy, columns=columns)
-
-    err_msg = "Selected columns, {}, are not unique in dataframe".format(key)
-    with pytest.raises(ValueError) as exc_info:
-        _get_column_indices(X, key)
-    assert str(exc_info.value) == err_msg
-
-
-def test_shuffle_on_ndim_equals_three():
-    def to_tuple(A):  # to make the inner arrays hashable
-        return tuple(tuple(tuple(C) for C in B) for B in A)
-
-    A = np.array([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])  # A.shape = (2,2,2)
-    S = set(to_tuple(A))
-    shuffle(A)  # shouldn't raise a ValueError for dim = 3
-    assert set(to_tuple(A)) == S
-
-
-def test_shuffle_dont_convert_to_array():
-    # Check that shuffle does not try to convert to numpy arrays with float
-    # dtypes can let any indexable datastructure pass-through.
-    a = ["a", "b", "c"]
-    b = np.array(["a", "b", "c"], dtype=object)
-    c = [1, 2, 3]
-    d = MockDataFrame(np.array([["a", 0], ["b", 1], ["c", 2]], dtype=object))
-    e = sp.csc_matrix(np.arange(6).reshape(3, 2))
-    a_s, b_s, c_s, d_s, e_s = shuffle(a, b, c, d, e, random_state=0)
-
-    assert a_s == ["c", "b", "a"]
-    assert type(a_s) == list
-
-    assert_array_equal(b_s, ["c", "b", "a"])
-    assert b_s.dtype == object
-
-    assert c_s == [3, 2, 1]
-    assert type(c_s) == list
-
-    assert_array_equal(d_s, np.array([["c", 2], ["b", 1], ["a", 0]], dtype=object))
-    assert type(d_s) == MockDataFrame
-
-    assert_array_equal(e_s.toarray(), np.array([[4, 5], [2, 3], [0, 1]]))
-
-
-def test_gen_even_slices():
-    # check that gen_even_slices contains all samples
-    some_range = range(10)
-    joined_range = list(chain(*[some_range[slice] for slice in gen_even_slices(10, 3)]))
-    assert_array_equal(some_range, joined_range)
-
-    # check that passing negative n_chunks raises an error
-    slices = gen_even_slices(10, -1)
-    with pytest.raises(ValueError, match="gen_even_slices got n_packs=-1, must be >=1"):
-        next(slices)
-
-
-@pytest.mark.parametrize(
-    ("row_bytes", "max_n_rows", "working_memory", "expected"),
-    [
-        (1024, None, 1, 1024),
-        (1024, None, 0.99999999, 1023),
-        (1023, None, 1, 1025),
-        (1025, None, 1, 1023),
-        (1024, None, 2, 2048),
-        (1024, 7, 1, 7),
-        (1024 * 1024, None, 1, 1),
-    ],
-)
-def test_get_chunk_n_rows(row_bytes, max_n_rows, working_memory, expected):
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
-        actual = get_chunk_n_rows(
-            row_bytes=row_bytes,
-            max_n_rows=max_n_rows,
-            working_memory=working_memory,
-        )
-
-    assert actual == expected
-    assert type(actual) is type(expected)
-    with config_context(working_memory=working_memory):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", UserWarning)
-            actual = get_chunk_n_rows(row_bytes=row_bytes, max_n_rows=max_n_rows)
-        assert actual == expected
-        assert type(actual) is type(expected)
-
-
-def test_get_chunk_n_rows_warns():
-    """Check that warning is raised when working_memory is too low."""
-    row_bytes = 1024 * 1024 + 1
-    max_n_rows = None
-    working_memory = 1
-    expected = 1
-
-    warn_msg = (
-        "Could not adhere to working_memory config. Currently 1MiB, 2MiB required."
-    )
-    with pytest.warns(UserWarning, match=warn_msg):
-        actual = get_chunk_n_rows(
-            row_bytes=row_bytes,
-            max_n_rows=max_n_rows,
-            working_memory=working_memory,
-        )
-
-    assert actual == expected
-    assert type(actual) is type(expected)
-
-    with config_context(working_memory=working_memory):
-        with pytest.warns(UserWarning, match=warn_msg):
-            actual = get_chunk_n_rows(row_bytes=row_bytes, max_n_rows=max_n_rows)
-        assert actual == expected
-        assert type(actual) is type(expected)
-
-
-@pytest.mark.parametrize(
-    ["source", "message", "is_long"],
-    [
-        ("ABC", string.ascii_lowercase, False),
-        ("ABCDEF", string.ascii_lowercase, False),
-        ("ABC", string.ascii_lowercase * 3, True),
-        ("ABC" * 10, string.ascii_lowercase, True),
-        ("ABC", string.ascii_lowercase + "\u1048", False),
-    ],
-)
-@pytest.mark.parametrize(
-    ["time", "time_str"],
-    [
-        (0.2, "   0.2s"),
-        (20, "  20.0s"),
-        (2000, "33.3min"),
-        (20000, "333.3min"),
-    ],
-)
-def test_message_with_time(source, message, is_long, time, time_str):
-    out = _message_with_time(source, message, time)
-    if is_long:
-        assert len(out) > 70
-    else:
-        assert len(out) == 70
-
-    assert out.startswith("[" + source + "] ")
-    out = out[len(source) + 3 :]
-
-    assert out.endswith(time_str)
-    out = out[: -len(time_str)]
-    assert out.endswith(", total=")
-    out = out[: -len(", total=")]
-    assert out.endswith(message)
-    out = out[: -len(message)]
-    assert out.endswith(" ")
-    out = out[:-1]
-
-    if is_long:
-        assert not out
-    else:
-        assert list(set(out)) == ["."]
-
-
-@pytest.mark.parametrize(
-    ["message", "expected"],
-    [
-        ("hello", _message_with_time("ABC", "hello", 0.1) + "\n"),
-        ("", _message_with_time("ABC", "", 0.1) + "\n"),
-        (None, ""),
-    ],
-)
-def test_print_elapsed_time(message, expected, capsys, monkeypatch):
-    monkeypatch.setattr(timeit, "default_timer", lambda: 0)
-    with _print_elapsed_time("ABC", message):
-        monkeypatch.setattr(timeit, "default_timer", lambda: 0.1)
-    assert capsys.readouterr().out == expected
-
-
-@pytest.mark.parametrize(
-    "value, result",
-    [
-        (float("nan"), True),
-        (np.nan, True),
-        (float(np.nan), True),
-        (np.float32(np.nan), True),
-        (np.float64(np.nan), True),
-        (0, False),
-        (0.0, False),
-        (None, False),
-        ("", False),
-        ("nan", False),
-        ([np.nan], False),
-        (9867966753463435747313673, False),  # Python int that overflows with C type
-    ],
-)
-def test_is_scalar_nan(value, result):
-    assert is_scalar_nan(value) is result
-    # make sure that we are returning a Python bool
-    assert isinstance(is_scalar_nan(value), bool)
-
-
-def test_approximate_mode():
-    """Make sure sklearn.utils._approximate_mode returns valid
-    results for cases where "class_counts * n_draws" is enough
-    to overflow 32-bit signed integer.
-
-    Non-regression test for:
-    https://github.com/scikit-learn/scikit-learn/issues/20774
+class TestGetEnvironProxies:
+    """Ensures that IP addresses are correctly matches with ranges
+    in no_proxy variable.
     """
-    X = np.array([99000, 1000], dtype=np.int32)
-    ret = _approximate_mode(class_counts=X, n_draws=25000, rng=0)
 
-    # Draws 25% of the total population, so in this case a fair draw means:
-    # 25% * 99.000 = 24.750
-    # 25% *  1.000 =    250
-    assert_array_equal(ret, [24750, 250])
+    @pytest.fixture(autouse=True, params=["no_proxy", "NO_PROXY"])
+    def no_proxy(self, request, monkeypatch):
+        monkeypatch.setenv(
+            request.param, "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1"
+        )
 
-
-def dummy_func():
-    pass
-
-
-def test_deprecation_joblib_api(tmpdir):
-
-    # Only parallel_backend and register_parallel_backend are not deprecated in
-    # sklearn.utils
-    from sklearn.utils import parallel_backend, register_parallel_backend
-
-    assert_no_warnings(parallel_backend, "loky", None)
-    assert_no_warnings(register_parallel_backend, "failing", None)
-
-    from sklearn.utils._joblib import joblib
-
-    del joblib.parallel.BACKENDS["failing"]
-
-
-@pytest.mark.parametrize("sequence", [[np.array(1), np.array(2)], [[1, 2], [3, 4]]])
-def test_to_object_array(sequence):
-    out = _to_object_array(sequence)
-    assert isinstance(out, np.ndarray)
-    assert out.dtype.kind == "O"
-    assert out.ndim == 1
-
-
-@pytest.mark.parametrize("array_type", ["array", "sparse", "dataframe"])
-def test_safe_assign(array_type):
-    """Check that `_safe_assign` works as expected."""
-    rng = np.random.RandomState(0)
-    X_array = rng.randn(10, 5)
-
-    row_indexer = [1, 2]
-    values = rng.randn(len(row_indexer), X_array.shape[1])
-    X = _convert_container(X_array, array_type)
-    _safe_assign(X, values, row_indexer=row_indexer)
-
-    assigned_portion = _safe_indexing(X, row_indexer, axis=0)
-    assert_allclose_dense_sparse(
-        assigned_portion, _convert_container(values, array_type)
+    @pytest.mark.parametrize(
+        "url",
+        (
+            "http://192.168.0.1:5000/",
+            "http://192.168.0.1/",
+            "http://172.16.1.1/",
+            "http://172.16.1.1:5000/",
+            "http://localhost.localdomain:5000/v1.0/",
+        ),
     )
+    def test_bypass(self, url):
+        assert get_environ_proxies(url, no_proxy=None) == {}
 
-    column_indexer = [1, 2]
-    values = rng.randn(X_array.shape[0], len(column_indexer))
-    X = _convert_container(X_array, array_type)
-    _safe_assign(X, values, column_indexer=column_indexer)
-
-    assigned_portion = _safe_indexing(X, column_indexer, axis=1)
-    assert_allclose_dense_sparse(
-        assigned_portion, _convert_container(values, array_type)
+    @pytest.mark.parametrize(
+        "url",
+        (
+            "http://192.168.1.1:5000/",
+            "http://192.168.1.1/",
+            "http://www.requests.com/",
+        ),
     )
+    def test_not_bypass(self, url):
+        assert get_environ_proxies(url, no_proxy=None) != {}
 
-    row_indexer, column_indexer = None, None
-    values = rng.randn(*X.shape)
-    X = _convert_container(X_array, array_type)
-    _safe_assign(X, values, column_indexer=column_indexer)
+    @pytest.mark.parametrize(
+        "url",
+        (
+            "http://192.168.1.1:5000/",
+            "http://192.168.1.1/",
+            "http://www.requests.com/",
+        ),
+    )
+    def test_bypass_no_proxy_keyword(self, url):
+        no_proxy = "192.168.1.1,requests.com"
+        assert get_environ_proxies(url, no_proxy=no_proxy) == {}
 
-    assert_allclose_dense_sparse(X, _convert_container(values, array_type))
+    @pytest.mark.parametrize(
+        "url",
+        (
+            "http://192.168.0.1:5000/",
+            "http://192.168.0.1/",
+            "http://172.16.1.1/",
+            "http://172.16.1.1:5000/",
+            "http://localhost.localdomain:5000/v1.0/",
+        ),
+    )
+    def test_not_bypass_no_proxy_keyword(self, url, monkeypatch):
+        # This is testing that the 'no_proxy' argument overrides the
+        # environment variable 'no_proxy'
+        monkeypatch.setenv("http_proxy", "http://proxy.example.com:3128/")
+        no_proxy = "192.168.1.1,requests.com"
+        assert get_environ_proxies(url, no_proxy=no_proxy) != {}
+
+
+class TestIsIPv4Address:
+    def test_valid(self):
+        assert is_ipv4_address("8.8.8.8")
+
+    @pytest.mark.parametrize("value", ("8.8.8.8.8", "localhost.localdomain"))
+    def test_invalid(self, value):
+        assert not is_ipv4_address(value)
+
+
+class TestIsValidCIDR:
+    def test_valid(self):
+        assert is_valid_cidr("192.168.1.0/24")
+
+    @pytest.mark.parametrize(
+        "value",
+        (
+            "8.8.8.8",
+            "192.168.1.0/a",
+            "192.168.1.0/128",
+            "192.168.1.0/-1",
+            "192.168.1.999/24",
+        ),
+    )
+    def test_invalid(self, value):
+        assert not is_valid_cidr(value)
+
+
+class TestAddressInNetwork:
+    def test_valid(self):
+        assert address_in_network("192.168.1.1", "192.168.1.0/24")
+
+    def test_invalid(self):
+        assert not address_in_network("172.16.0.1", "192.168.1.0/24")
+
+
+class TestGuessFilename:
+    @pytest.mark.parametrize(
+        "value",
+        (1, type("Fake", (object,), {"name": 1})()),
+    )
+    def test_guess_filename_invalid(self, value):
+        assert guess_filename(value) is None
+
+    @pytest.mark.parametrize(
+        "value, expected_type",
+        (
+            (b"value", compat.bytes),
+            (b"value".decode("utf-8"), compat.str),
+        ),
+    )
+    def test_guess_filename_valid(self, value, expected_type):
+        obj = type("Fake", (object,), {"name": value})()
+        result = guess_filename(obj)
+        assert result == value
+        assert isinstance(result, expected_type)
+
+
+class TestExtractZippedPaths:
+    @pytest.mark.parametrize(
+        "path",
+        (
+            "/",
+            __file__,
+            pytest.__file__,
+            "/etc/invalid/location",
+        ),
+    )
+    def test_unzipped_paths_unchanged(self, path):
+        assert path == extract_zipped_paths(path)
+
+    def test_zipped_paths_extracted(self, tmpdir):
+        zipped_py = tmpdir.join("test.zip")
+        with zipfile.ZipFile(zipped_py.strpath, "w") as f:
+            f.write(__file__)
+
+        _, name = os.path.splitdrive(__file__)
+        zipped_path = os.path.join(zipped_py.strpath, name.lstrip(r"\/"))
+        extracted_path = extract_zipped_paths(zipped_path)
+
+        assert extracted_path != zipped_path
+        assert os.path.exists(extracted_path)
+        assert filecmp.cmp(extracted_path, __file__)
+
+    def test_invalid_unc_path(self):
+        path = r"\\localhost\invalid\location"
+        assert extract_zipped_paths(path) == path
+
+
+class TestContentEncodingDetection:
+    def test_none(self):
+        encodings = get_encodings_from_content("")
+        assert not len(encodings)
+
+    @pytest.mark.parametrize(
+        "content",
+        (
+            # HTML5 meta charset attribute
+            '<meta charset="UTF-8">',
+            # HTML4 pragma directive
+            '<meta http-equiv="Content-type" content="text/html;charset=UTF-8">',
+            # XHTML 1.x served with text/html MIME type
+            '<meta http-equiv="Content-type" content="text/html;charset=UTF-8" />',
+            # XHTML 1.x served as XML
+            '<?xml version="1.0" encoding="UTF-8"?>',
+        ),
+    )
+    def test_pragmas(self, content):
+        encodings = get_encodings_from_content(content)
+        assert len(encodings) == 1
+        assert encodings[0] == "UTF-8"
+
+    def test_precedence(self):
+        content = """
+        <?xml version="1.0" encoding="XML"?>
+        <meta charset="HTML5">
+        <meta http-equiv="Content-type" content="text/html;charset=HTML4" />
+        """.strip()
+        assert get_encodings_from_content(content) == ["HTML5", "HTML4", "XML"]
+
+
+class TestGuessJSONUTF:
+    @pytest.mark.parametrize(
+        "encoding",
+        (
+            "utf-32",
+            "utf-8-sig",
+            "utf-16",
+            "utf-8",
+            "utf-16-be",
+            "utf-16-le",
+            "utf-32-be",
+            "utf-32-le",
+        ),
+    )
+    def test_encoded(self, encoding):
+        data = "{}".encode(encoding)
+        assert guess_json_utf(data) == encoding
+
+    def test_bad_utf_like_encoding(self):
+        assert guess_json_utf(b"\x00\x00\x00\x00") is None
+
+    @pytest.mark.parametrize(
+        ("encoding", "expected"),
+        (
+            ("utf-16-be", "utf-16"),
+            ("utf-16-le", "utf-16"),
+            ("utf-32-be", "utf-32"),
+            ("utf-32-le", "utf-32"),
+        ),
+    )
+    def test_guess_by_bom(self, encoding, expected):
+        data = "\ufeff{}".encode(encoding)
+        assert guess_json_utf(data) == expected
+
+
+USER = PASSWORD = "%!*'();:@&=+$,/?#[] "
+ENCODED_USER = compat.quote(USER, "")
+ENCODED_PASSWORD = compat.quote(PASSWORD, "")
+
+
+@pytest.mark.parametrize(
+    "url, auth",
+    (
+        (
+            f"http://{ENCODED_USER}:{ENCODED_PASSWORD}@request.com/url.html#test",
+            (USER, PASSWORD),
+        ),
+        ("http://user:pass@complex.url.com/path?query=yes", ("user", "pass")),
+        (
+            "http://user:pass%20pass@complex.url.com/path?query=yes",
+            ("user", "pass pass"),
+        ),
+        ("http://user:pass pass@complex.url.com/path?query=yes", ("user", "pass pass")),
+        (
+            "http://user%25user:pass@complex.url.com/path?query=yes",
+            ("user%user", "pass"),
+        ),
+        (
+            "http://user:pass%23pass@complex.url.com/path?query=yes",
+            ("user", "pass#pass"),
+        ),
+        ("http://complex.url.com/path?query=yes", ("", "")),
+    ),
+)
+def test_get_auth_from_url(url, auth):
+    assert get_auth_from_url(url) == auth
+
+
+@pytest.mark.parametrize(
+    "uri, expected",
+    (
+        (
+            # Ensure requoting doesn't break expectations
+            "http://example.com/fiz?buz=%25ppicture",
+            "http://example.com/fiz?buz=%25ppicture",
+        ),
+        (
+            # Ensure we handle unquoted percent signs in redirects
+            "http://example.com/fiz?buz=%ppicture",
+            "http://example.com/fiz?buz=%25ppicture",
+        ),
+    ),
+)
+def test_requote_uri_with_unquoted_percents(uri, expected):
+    """See: https://github.com/psf/requests/issues/2356"""
+    assert requote_uri(uri) == expected
+
+
+@pytest.mark.parametrize(
+    "uri, expected",
+    (
+        (
+            # Illegal bytes
+            "http://example.com/?a=%--",
+            "http://example.com/?a=%--",
+        ),
+        (
+            # Reserved characters
+            "http://example.com/?a=%300",
+            "http://example.com/?a=00",
+        ),
+    ),
+)
+def test_unquote_unreserved(uri, expected):
+    assert unquote_unreserved(uri) == expected
+
+
+@pytest.mark.parametrize(
+    "mask, expected",
+    (
+        (8, "255.0.0.0"),
+        (24, "255.255.255.0"),
+        (25, "255.255.255.128"),
+    ),
+)
+def test_dotted_netmask(mask, expected):
+    assert dotted_netmask(mask) == expected
+
+
+http_proxies = {
+    "http": "http://http.proxy",
+    "http://some.host": "http://some.host.proxy",
+}
+all_proxies = {
+    "all": "socks5://http.proxy",
+    "all://some.host": "socks5://some.host.proxy",
+}
+mixed_proxies = {
+    "http": "http://http.proxy",
+    "http://some.host": "http://some.host.proxy",
+    "all": "socks5://http.proxy",
+}
+
+
+@pytest.mark.parametrize(
+    "url, expected, proxies",
+    (
+        ("hTTp://u:p@Some.Host/path", "http://some.host.proxy", http_proxies),
+        ("hTTp://u:p@Other.Host/path", "http://http.proxy", http_proxies),
+        ("hTTp:///path", "http://http.proxy", http_proxies),
+        ("hTTps://Other.Host", None, http_proxies),
+        ("file:///etc/motd", None, http_proxies),
+        ("hTTp://u:p@Some.Host/path", "socks5://some.host.proxy", all_proxies),
+        ("hTTp://u:p@Other.Host/path", "socks5://http.proxy", all_proxies),
+        ("hTTp:///path", "socks5://http.proxy", all_proxies),
+        ("hTTps://Other.Host", "socks5://http.proxy", all_proxies),
+        ("http://u:p@other.host/path", "http://http.proxy", mixed_proxies),
+        ("http://u:p@some.host/path", "http://some.host.proxy", mixed_proxies),
+        ("https://u:p@other.host/path", "socks5://http.proxy", mixed_proxies),
+        ("https://u:p@some.host/path", "socks5://http.proxy", mixed_proxies),
+        ("https://", "socks5://http.proxy", mixed_proxies),
+        # XXX: unsure whether this is reasonable behavior
+        ("file:///etc/motd", "socks5://http.proxy", all_proxies),
+    ),
+)
+def test_select_proxies(url, expected, proxies):
+    """Make sure we can select per-host proxies correctly."""
+    assert select_proxy(url, proxies) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        ('foo="is a fish", bar="as well"', {"foo": "is a fish", "bar": "as well"}),
+        ("key_without_value", {"key_without_value": None}),
+    ),
+)
+def test_parse_dict_header(value, expected):
+    assert parse_dict_header(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        ("application/xml", ("application/xml", {})),
+        (
+            "application/json ; charset=utf-8",
+            ("application/json", {"charset": "utf-8"}),
+        ),
+        (
+            "application/json ; Charset=utf-8",
+            ("application/json", {"charset": "utf-8"}),
+        ),
+        ("text/plain", ("text/plain", {})),
+        (
+            "multipart/form-data; boundary = something ; boundary2='something_else' ; no_equals ",
+            (
+                "multipart/form-data",
+                {
+                    "boundary": "something",
+                    "boundary2": "something_else",
+                    "no_equals": True,
+                },
+            ),
+        ),
+        (
+            'multipart/form-data; boundary = something ; boundary2="something_else" ; no_equals ',
+            (
+                "multipart/form-data",
+                {
+                    "boundary": "something",
+                    "boundary2": "something_else",
+                    "no_equals": True,
+                },
+            ),
+        ),
+        (
+            "multipart/form-data; boundary = something ; 'boundary2=something_else' ; no_equals ",
+            (
+                "multipart/form-data",
+                {
+                    "boundary": "something",
+                    "boundary2": "something_else",
+                    "no_equals": True,
+                },
+            ),
+        ),
+        (
+            'multipart/form-data; boundary = something ; "boundary2=something_else" ; no_equals ',
+            (
+                "multipart/form-data",
+                {
+                    "boundary": "something",
+                    "boundary2": "something_else",
+                    "no_equals": True,
+                },
+            ),
+        ),
+        ("application/json ; ; ", ("application/json", {})),
+    ),
+)
+def test__parse_content_type_header(value, expected):
+    assert _parse_content_type_header(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        (CaseInsensitiveDict(), None),
+        (
+            CaseInsensitiveDict({"content-type": "application/json; charset=utf-8"}),
+            "utf-8",
+        ),
+        (CaseInsensitiveDict({"content-type": "text/plain"}), "ISO-8859-1"),
+    ),
+)
+def test_get_encoding_from_headers(value, expected):
+    assert get_encoding_from_headers(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, length",
+    (
+        ("", 0),
+        ("T", 1),
+        ("Test", 4),
+        ("Cont", 0),
+        ("Other", -5),
+        ("Content", None),
+    ),
+)
+def test_iter_slices(value, length):
+    if length is None or (length <= 0 and len(value) > 0):
+        # Reads all content at once
+        assert len(list(iter_slices(value, length))) == 1
+    else:
+        assert len(list(iter_slices(value, 1))) == length
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        (
+            '<http:/.../front.jpeg>; rel=front; type="image/jpeg"',
+            [{"url": "http:/.../front.jpeg", "rel": "front", "type": "image/jpeg"}],
+        ),
+        ("<http:/.../front.jpeg>", [{"url": "http:/.../front.jpeg"}]),
+        ("<http:/.../front.jpeg>;", [{"url": "http:/.../front.jpeg"}]),
+        (
+            '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;',
+            [
+                {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+                {"url": "http://.../back.jpeg"},
+            ],
+        ),
+        ("", []),
+    ),
+)
+def test_parse_header_links(value, expected):
+    assert parse_header_links(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        ("example.com/path", "http://example.com/path"),
+        ("//example.com/path", "http://example.com/path"),
+        ("example.com:80", "http://example.com:80"),
+        (
+            "http://user:pass@example.com/path?query",
+            "http://user:pass@example.com/path?query",
+        ),
+        ("http://user@example.com/path?query", "http://user@example.com/path?query"),
+    ),
+)
+def test_prepend_scheme_if_needed(value, expected):
+    assert prepend_scheme_if_needed(value, "http") == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        ("T", "T"),
+        (b"T", "T"),
+        ("T", "T"),
+    ),
+)
+def test_to_native_string(value, expected):
+    assert to_native_string(value) == expected
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    (
+        ("http://u:p@example.com/path?a=1#test", "http://example.com/path?a=1"),
+        ("http://example.com/path", "http://example.com/path"),
+        ("//u:p@example.com/path", "//example.com/path"),
+        ("//example.com/path", "//example.com/path"),
+        ("example.com/path", "//example.com/path"),
+        ("scheme:u:p@example.com/path", "scheme://example.com/path"),
+    ),
+)
+def test_urldefragauth(url, expected):
+    assert urldefragauth(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    (
+        ("http://192.168.0.1:5000/", True),
+        ("http://192.168.0.1/", True),
+        ("http://172.16.1.1/", True),
+        ("http://172.16.1.1:5000/", True),
+        ("http://localhost.localdomain:5000/v1.0/", True),
+        ("http://google.com:6000/", True),
+        ("http://172.16.1.12/", False),
+        ("http://172.16.1.12:5000/", False),
+        ("http://google.com:5000/v1.0/", False),
+        ("file:///some/path/on/disk", True),
+    ),
+)
+def test_should_bypass_proxies(url, expected, monkeypatch):
+    """Tests for function should_bypass_proxies to check if proxy
+    can be bypassed or not
+    """
+    monkeypatch.setenv(
+        "no_proxy",
+        "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1, google.com:6000",
+    )
+    monkeypatch.setenv(
+        "NO_PROXY",
+        "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1, google.com:6000",
+    )
+    assert should_bypass_proxies(url, no_proxy=None) == expected
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    (
+        ("http://172.16.1.1/", "172.16.1.1"),
+        ("http://172.16.1.1:5000/", "172.16.1.1"),
+        ("http://user:pass@172.16.1.1", "172.16.1.1"),
+        ("http://user:pass@172.16.1.1:5000", "172.16.1.1"),
+        ("http://hostname/", "hostname"),
+        ("http://hostname:5000/", "hostname"),
+        ("http://user:pass@hostname", "hostname"),
+        ("http://user:pass@hostname:5000", "hostname"),
+    ),
+)
+def test_should_bypass_proxies_pass_only_hostname(url, expected, mocker):
+    """The proxy_bypass function should be called with a hostname or IP without
+    a port number or auth credentials.
+    """
+    proxy_bypass = mocker.patch("requests.utils.proxy_bypass")
+    should_bypass_proxies(url, no_proxy=None)
+    proxy_bypass.assert_called_once_with(expected)
+
+
+@pytest.mark.parametrize(
+    "cookiejar",
+    (
+        compat.cookielib.CookieJar(),
+        RequestsCookieJar(),
+    ),
+)
+def test_add_dict_to_cookiejar(cookiejar):
+    """Ensure add_dict_to_cookiejar works for
+    non-RequestsCookieJar CookieJars
+    """
+    cookiedict = {"test": "cookies", "good": "cookies"}
+    cj = add_dict_to_cookiejar(cookiejar, cookiedict)
+    cookies = {cookie.name: cookie.value for cookie in cj}
+    assert cookiedict == cookies
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    (
+        ("test", True),
+        ("æíöû", False),
+        ("ジェーピーニック", False),
+    ),
+)
+def test_unicode_is_ascii(value, expected):
+    assert unicode_is_ascii(value) is expected
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    (
+        ("http://192.168.0.1:5000/", True),
+        ("http://192.168.0.1/", True),
+        ("http://172.16.1.1/", True),
+        ("http://172.16.1.1:5000/", True),
+        ("http://localhost.localdomain:5000/v1.0/", True),
+        ("http://172.16.1.12/", False),
+        ("http://172.16.1.12:5000/", False),
+        ("http://google.com:5000/v1.0/", False),
+    ),
+)
+def test_should_bypass_proxies_no_proxy(url, expected, monkeypatch):
+    """Tests for function should_bypass_proxies to check if proxy
+    can be bypassed or not using the 'no_proxy' argument
+    """
+    no_proxy = "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1"
+    # Test 'no_proxy' argument
+    assert should_bypass_proxies(url, no_proxy=no_proxy) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Test only on Windows")
+@pytest.mark.parametrize(
+    "url, expected, override",
+    (
+        ("http://192.168.0.1:5000/", True, None),
+        ("http://192.168.0.1/", True, None),
+        ("http://172.16.1.1/", True, None),
+        ("http://172.16.1.1:5000/", True, None),
+        ("http://localhost.localdomain:5000/v1.0/", True, None),
+        ("http://172.16.1.22/", False, None),
+        ("http://172.16.1.22:5000/", False, None),
+        ("http://google.com:5000/v1.0/", False, None),
+        ("http://mylocalhostname:5000/v1.0/", True, "<local>"),
+        ("http://192.168.0.1/", False, ""),
+    ),
+)
+def test_should_bypass_proxies_win_registry(url, expected, override, monkeypatch):
+    """Tests for function should_bypass_proxies to check if proxy
+    can be bypassed or not with Windows registry settings
+    """
+    if override is None:
+        override = "192.168.*;127.0.0.1;localhost.localdomain;172.16.1.1"
+    import winreg
+
+    class RegHandle:
+        def Close(self):
+            pass
+
+    ie_settings = RegHandle()
+    proxyEnableValues = deque([1, "1"])
+
+    def OpenKey(key, subkey):
+        return ie_settings
+
+    def QueryValueEx(key, value_name):
+        if key is ie_settings:
+            if value_name == "ProxyEnable":
+                # this could be a string (REG_SZ) or a 32-bit number (REG_DWORD)
+                proxyEnableValues.rotate()
+                return [proxyEnableValues[0]]
+            elif value_name == "ProxyOverride":
+                return [override]
+
+    monkeypatch.setenv("http_proxy", "")
+    monkeypatch.setenv("https_proxy", "")
+    monkeypatch.setenv("ftp_proxy", "")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setattr(winreg, "OpenKey", OpenKey)
+    monkeypatch.setattr(winreg, "QueryValueEx", QueryValueEx)
+    assert should_bypass_proxies(url, None) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Test only on Windows")
+def test_should_bypass_proxies_win_registry_bad_values(monkeypatch):
+    """Tests for function should_bypass_proxies to check if proxy
+    can be bypassed or not with Windows invalid registry settings.
+    """
+    import winreg
+
+    class RegHandle:
+        def Close(self):
+            pass
+
+    ie_settings = RegHandle()
+
+    def OpenKey(key, subkey):
+        return ie_settings
+
+    def QueryValueEx(key, value_name):
+        if key is ie_settings:
+            if value_name == "ProxyEnable":
+                # Invalid response; Should be an int or int-y value
+                return [""]
+            elif value_name == "ProxyOverride":
+                return ["192.168.*;127.0.0.1;localhost.localdomain;172.16.1.1"]
+
+    monkeypatch.setenv("http_proxy", "")
+    monkeypatch.setenv("https_proxy", "")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setattr(winreg, "OpenKey", OpenKey)
+    monkeypatch.setattr(winreg, "QueryValueEx", QueryValueEx)
+    assert should_bypass_proxies("http://172.16.1.1/", None) is False
+
+
+@pytest.mark.parametrize(
+    "env_name, value",
+    (
+        ("no_proxy", "192.168.0.0/24,127.0.0.1,localhost.localdomain"),
+        ("no_proxy", None),
+        ("a_new_key", "192.168.0.0/24,127.0.0.1,localhost.localdomain"),
+        ("a_new_key", None),
+    ),
+)
+def test_set_environ(env_name, value):
+    """Tests set_environ will set environ values and will restore the environ."""
+    environ_copy = copy.deepcopy(os.environ)
+    with set_environ(env_name, value):
+        assert os.environ.get(env_name) == value
+
+    assert os.environ == environ_copy
+
+
+def test_set_environ_raises_exception():
+    """Tests set_environ will raise exceptions in context when the
+    value parameter is None."""
+    with pytest.raises(Exception) as exception:
+        with set_environ("test1", None):
+            raise Exception("Expected exception")
+
+    assert "Expected exception" in str(exception.value)

@@ -1,81 +1,40 @@
-import os
-import shutil
-from ._registry import method_files_map
+# Copyright (c) 2018, Ansible Project
+# Simplified BSD License (see licenses/simplified_bsd.txt or https://opensource.org/licenses/BSD-2-Clause)
 
-try:
-    import appdirs
-except ImportError:
-    appdirs = None
+from __future__ import absolute_import, division, print_function
+__metaclass__ = type
 
 
-def _clear_cache(datasets, cache_dir=None, method_map=None):
-    if method_map is None:
-        # Use SciPy Datasets method map
-        method_map = method_files_map
-    if cache_dir is None:
-        # Use default cache_dir path
-        if appdirs is None:
-            # appdirs is pooch dependency
-            raise ImportError("Missing optional dependency 'pooch' required "
-                              "for scipy.datasets module. Please use pip or "
-                              "conda to install 'pooch'.")
-        cache_dir = appdirs.user_cache_dir("scipy-data")
-
-    if not os.path.exists(cache_dir):
-        print(f"Cache Directory {cache_dir} doesn't exist. Nothing to clear.")
-        return
-
-    if datasets is None:
-        print(f"Cleaning the cache directory {cache_dir}!")
-        shutil.rmtree(cache_dir)
-    else:
-        if not isinstance(datasets, (list, tuple)):
-            # single dataset method passed should be converted to list
-            datasets = [datasets, ]
-        for dataset in datasets:
-            assert callable(dataset)
-            dataset_name = dataset.__name__  # Name of the dataset method
-            if dataset_name not in method_map:
-                raise ValueError(f"Dataset method {dataset_name} doesn't "
-                                 "exist. Please check if the passed dataset "
-                                 "is a subset of the following dataset "
-                                 f"methods: {list(method_map.keys())}")
-
-            data_files = method_map[dataset_name]
-            data_filepaths = [os.path.join(cache_dir, file)
-                              for file in data_files]
-            for data_filepath in data_filepaths:
-                if os.path.exists(data_filepath):
-                    print("Cleaning the file "
-                          f"{os.path.split(data_filepath)[1]} "
-                          f"for dataset {dataset_name}")
-                    os.remove(data_filepath)
-                else:
-                    print(f"Path {data_filepath} doesn't exist. "
-                          "Nothing to clear.")
+"""
+Modules in _utils are waiting to find a better home.  If you need to use them, be prepared for them
+to move to a different location in the future.
+"""
 
 
-def clear_cache(datasets=None):
-    """
-    Cleans the scipy datasets cache directory.
+def get_all_subclasses(cls):
+    '''
+    Recursively search and find all subclasses of a given class
 
-    If a scipy.datasets method or a list/tuple of the same is
-    provided, then clear_cache removes all the data files
-    associated to the passed dataset method callable(s).
+    :arg cls: A python class
+    :rtype: set
+    :returns: The set of python classes which are the subclasses of `cls`.
 
-    By default, it removes all the cached data files.
-
-    Parameters
-    ----------
-    datasets : callable or list/tuple of callable or None
-
-    Examples
-    --------
-    >>> from scipy import datasets
-    >>> ascent_array = datasets.ascent()
-    >>> ascent_array.shape
-    (512, 512)
-    >>> datasets.clear_cache([datasets.ascent])
-    Cleaning the file ascent.dat for dataset ascent
-    """
-    _clear_cache(datasets)
+    In python, you can use a class's :py:meth:`__subclasses__` method to determine what subclasses
+    of a class exist.  However, `__subclasses__` only goes one level deep.  This function searches
+    each child class's `__subclasses__` method to find all of the descendent classes.  It then
+    returns an iterable of the descendent classes.
+    '''
+    # Retrieve direct subclasses
+    subclasses = set(cls.__subclasses__())
+    to_visit = list(subclasses)
+    # Then visit all subclasses
+    while to_visit:
+        for sc in to_visit:
+            # The current class is now visited, so remove it from list
+            to_visit.remove(sc)
+            # Appending all subclasses to visit and keep a reference of available class
+            for ssc in sc.__subclasses__():
+                if ssc not in subclasses:
+                    to_visit.append(ssc)
+                    subclasses.add(ssc)
+    return subclasses

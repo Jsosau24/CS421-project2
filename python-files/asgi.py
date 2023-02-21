@@ -1,321 +1,156 @@
-import logging
-import sys
-import tempfile
-import traceback
-from contextlib import aclosing
+"""
+Instrumentation for Django 3.0
 
-from asgiref.sync import ThreadSensitiveContext, sync_to_async
+Since this file contains `async def` it is conditionally imported in
+`sentry_sdk.integrations.django` (depending on the existence of
+`django.core.handlers.asgi`.
+"""
 
-from django.conf import settings
-from django.core import signals
-from django.core.exceptions import RequestAborted, RequestDataTooBig
-from django.core.handlers import base
-from django.http import (
-    FileResponse,
-    HttpRequest,
-    HttpResponse,
-    HttpResponseBadRequest,
-    HttpResponseServerError,
-    QueryDict,
-    parse_cookie,
-)
-from django.urls import set_script_prefix
-from django.utils.functional import cached_property
+import asyncio
 
-logger = logging.getLogger("django.request")
+from sentry_sdk import Hub, _functools
+from sentry_sdk._types import MYPY
+from sentry_sdk.consts import OP
+
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+if MYPY:
+    from typing import Any
+    from typing import Union
+    from typing import Callable
+
+    from django.http.response import HttpResponse
 
 
-class ASGIRequest(HttpRequest):
+def patch_django_asgi_handler_impl(cls):
+    # type: (Any) -> None
+
+    from sentry_sdk.integrations.django import DjangoIntegration
+
+    old_app = cls.__call__
+
+    async def sentry_patched_asgi_handler(self, scope, receive, send):
+        # type: (Any, Any, Any, Any) -> Any
+        if Hub.current.get_integration(DjangoIntegration) is None:
+            return await old_app(self, scope, receive, send)
+
+        middleware = SentryAsgiMiddleware(
+            old_app.__get__(self, cls), unsafe_context_data=True
+        )._run_asgi3
+        return await middleware(scope, receive, send)
+
+    cls.__call__ = sentry_patched_asgi_handler
+
+
+def patch_get_response_async(cls, _before_get_response):
+    # type: (Any, Any) -> None
+    old_get_response_async = cls.get_response_async
+
+    async def sentry_patched_get_response_async(self, request):
+        # type: (Any, Any) -> Union[HttpResponse, BaseException]
+        _before_get_response(request)
+        return await old_get_response_async(self, request)
+
+    cls.get_response_async = sentry_patched_get_response_async
+
+
+def patch_channels_asgi_handler_impl(cls):
+    # type: (Any) -> None
+
+    import channels  # type: ignore
+    from sentry_sdk.integrations.django import DjangoIntegration
+
+    if channels.__version__ < "3.0.0":
+
+        old_app = cls.__call__
+
+        async def sentry_patched_asgi_handler(self, receive, send):
+            # type: (Any, Any, Any) -> Any
+            if Hub.current.get_integration(DjangoIntegration) is None:
+                return await old_app(self, receive, send)
+
+            middleware = SentryAsgiMiddleware(
+                lambda _scope: old_app.__get__(self, cls), unsafe_context_data=True
+            )
+
+            return await middleware(self.scope)(receive, send)
+
+        cls.__call__ = sentry_patched_asgi_handler
+
+    else:
+        # The ASGI handler in Channels >= 3 has the same signature as
+        # the Django handler.
+        patch_django_asgi_handler_impl(cls)
+
+
+def wrap_async_view(hub, callback):
+    # type: (Hub, Any) -> Any
+    @_functools.wraps(callback)
+    async def sentry_wrapped_callback(request, *args, **kwargs):
+        # type: (Any, *Any, **Any) -> Any
+
+        with hub.configure_scope() as sentry_scope:
+            if sentry_scope.profile is not None:
+                sentry_scope.profile.update_active_thread_id()
+
+            with hub.start_span(
+                op=OP.VIEW_RENDER, description=request.resolver_match.view_name
+            ):
+                return await callback(request, *args, **kwargs)
+
+    return sentry_wrapped_callback
+
+
+def _asgi_middleware_mixin_factory(_check_middleware_span):
+    # type: (Callable[..., Any]) -> Any
     """
-    Custom request subclass that decodes from an ASGI-standard request dict
-    and wraps request body handling.
+    Mixin class factory that generates a middleware mixin for handling requests
+    in async mode.
     """
 
-    # Number of seconds until a Request gives up on trying to read a request
-    # body and aborts.
-    body_receive_timeout = 60
+    class SentryASGIMixin:
+        if MYPY:
+            _inner = None
 
-    def __init__(self, scope, body_file):
-        self.scope = scope
-        self._post_parse_error = False
-        self._read_started = False
-        self.resolver_match = None
-        self.script_name = self.scope.get("root_path", "")
-        if self.script_name:
-            # TODO: Better is-prefix checking, slash handling?
-            self.path_info = scope["path"].removeprefix(self.script_name)
-        else:
-            self.path_info = scope["path"]
-        # The Django path is different from ASGI scope path args, it should
-        # combine with script name.
-        if self.script_name:
-            self.path = "%s/%s" % (
-                self.script_name.rstrip("/"),
-                self.path_info.replace("/", "", 1),
-            )
-        else:
-            self.path = scope["path"]
-        # HTTP basics.
-        self.method = self.scope["method"].upper()
-        # Ensure query string is encoded correctly.
-        query_string = self.scope.get("query_string", "")
-        if isinstance(query_string, bytes):
-            query_string = query_string.decode()
-        self.META = {
-            "REQUEST_METHOD": self.method,
-            "QUERY_STRING": query_string,
-            "SCRIPT_NAME": self.script_name,
-            "PATH_INFO": self.path_info,
-            # WSGI-expecting code will need these for a while
-            "wsgi.multithread": True,
-            "wsgi.multiprocess": True,
-        }
-        if self.scope.get("client"):
-            self.META["REMOTE_ADDR"] = self.scope["client"][0]
-            self.META["REMOTE_HOST"] = self.META["REMOTE_ADDR"]
-            self.META["REMOTE_PORT"] = self.scope["client"][1]
-        if self.scope.get("server"):
-            self.META["SERVER_NAME"] = self.scope["server"][0]
-            self.META["SERVER_PORT"] = str(self.scope["server"][1])
-        else:
-            self.META["SERVER_NAME"] = "unknown"
-            self.META["SERVER_PORT"] = "0"
-        # Headers go into META.
-        for name, value in self.scope.get("headers", []):
-            name = name.decode("latin1")
-            if name == "content-length":
-                corrected_name = "CONTENT_LENGTH"
-            elif name == "content-type":
-                corrected_name = "CONTENT_TYPE"
-            else:
-                corrected_name = "HTTP_%s" % name.upper().replace("-", "_")
-            # HTTP/2 say only ASCII chars are allowed in headers, but decode
-            # latin1 just in case.
-            value = value.decode("latin1")
-            if corrected_name in self.META:
-                value = self.META[corrected_name] + "," + value
-            self.META[corrected_name] = value
-        # Pull out request encoding, if provided.
-        self._set_content_type_params(self.META)
-        # Directly assign the body file to be our stream.
-        self._stream = body_file
-        # Other bits.
-        self.resolver_match = None
+        def __init__(self, get_response):
+            # type: (Callable[..., Any]) -> None
+            self.get_response = get_response
+            self._acall_method = None
+            self._async_check()
 
-    @cached_property
-    def GET(self):
-        return QueryDict(self.META["QUERY_STRING"])
+        def _async_check(self):
+            # type: () -> None
+            """
+            If get_response is a coroutine function, turns us into async mode so
+            a thread is not consumed during a whole request.
+            Taken from django.utils.deprecation::MiddlewareMixin._async_check
+            """
+            if asyncio.iscoroutinefunction(self.get_response):
+                self._is_coroutine = asyncio.coroutines._is_coroutine  # type: ignore
 
-    def _get_scheme(self):
-        return self.scope.get("scheme") or super()._get_scheme()
+        def async_route_check(self):
+            # type: () -> bool
+            """
+            Function that checks if we are in async mode,
+            and if we are forwards the handling of requests to __acall__
+            """
+            return asyncio.iscoroutinefunction(self.get_response)
 
-    def _get_post(self):
-        if not hasattr(self, "_post"):
-            self._load_post_and_files()
-        return self._post
+        async def __acall__(self, *args, **kwargs):
+            # type: (*Any, **Any) -> Any
+            f = self._acall_method
+            if f is None:
+                if hasattr(self._inner, "__acall__"):
+                    self._acall_method = f = self._inner.__acall__  # type: ignore
+                else:
+                    self._acall_method = f = self._inner
 
-    def _set_post(self, post):
-        self._post = post
+            middleware_span = _check_middleware_span(old_method=f)
 
-    def _get_files(self):
-        if not hasattr(self, "_files"):
-            self._load_post_and_files()
-        return self._files
+            if middleware_span is None:
+                return await f(*args, **kwargs)
 
-    POST = property(_get_post, _set_post)
-    FILES = property(_get_files)
+            with middleware_span:
+                return await f(*args, **kwargs)
 
-    @cached_property
-    def COOKIES(self):
-        return parse_cookie(self.META.get("HTTP_COOKIE", ""))
-
-    def close(self):
-        super().close()
-        self._stream.close()
-
-
-class ASGIHandler(base.BaseHandler):
-    """Handler for ASGI requests."""
-
-    request_class = ASGIRequest
-    # Size to chunk response bodies into for multiple response messages.
-    chunk_size = 2**16
-
-    def __init__(self):
-        super().__init__()
-        self.load_middleware(is_async=True)
-
-    async def __call__(self, scope, receive, send):
-        """
-        Async entrypoint - parses the request and hands off to get_response.
-        """
-        # Serve only HTTP connections.
-        # FIXME: Allow to override this.
-        if scope["type"] != "http":
-            raise ValueError(
-                "Django can only handle ASGI/HTTP connections, not %s." % scope["type"]
-            )
-
-        async with ThreadSensitiveContext():
-            await self.handle(scope, receive, send)
-
-    async def handle(self, scope, receive, send):
-        """
-        Handles the ASGI request. Called via the __call__ method.
-        """
-        # Receive the HTTP request body as a stream object.
-        try:
-            body_file = await self.read_body(receive)
-        except RequestAborted:
-            return
-        # Request is complete and can be served.
-        set_script_prefix(self.get_script_prefix(scope))
-        await sync_to_async(signals.request_started.send, thread_sensitive=True)(
-            sender=self.__class__, scope=scope
-        )
-        # Get the request and check for basic issues.
-        request, error_response = self.create_request(scope, body_file)
-        if request is None:
-            body_file.close()
-            await self.send_response(error_response, send)
-            return
-        # Get the response, using the async mode of BaseHandler.
-        response = await self.get_response_async(request)
-        response._handler_class = self.__class__
-        # Increase chunk size on file responses (ASGI servers handles low-level
-        # chunking).
-        if isinstance(response, FileResponse):
-            response.block_size = self.chunk_size
-        # Send the response.
-        await self.send_response(response, send)
-
-    async def read_body(self, receive):
-        """Reads an HTTP body from an ASGI connection."""
-        # Use the tempfile that auto rolls-over to a disk file as it fills up.
-        body_file = tempfile.SpooledTemporaryFile(
-            max_size=settings.FILE_UPLOAD_MAX_MEMORY_SIZE, mode="w+b"
-        )
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                body_file.close()
-                # Early client disconnect.
-                raise RequestAborted()
-            # Add a body chunk from the message, if provided.
-            if "body" in message:
-                body_file.write(message["body"])
-            # Quit out if that's the end.
-            if not message.get("more_body", False):
-                break
-        body_file.seek(0)
-        return body_file
-
-    def create_request(self, scope, body_file):
-        """
-        Create the Request object and returns either (request, None) or
-        (None, response) if there is an error response.
-        """
-        try:
-            return self.request_class(scope, body_file), None
-        except UnicodeDecodeError:
-            logger.warning(
-                "Bad Request (UnicodeDecodeError)",
-                exc_info=sys.exc_info(),
-                extra={"status_code": 400},
-            )
-            return None, HttpResponseBadRequest()
-        except RequestDataTooBig:
-            return None, HttpResponse("413 Payload too large", status=413)
-
-    def handle_uncaught_exception(self, request, resolver, exc_info):
-        """Last-chance handler for exceptions."""
-        # There's no WSGI server to catch the exception further up
-        # if this fails, so translate it into a plain text response.
-        try:
-            return super().handle_uncaught_exception(request, resolver, exc_info)
-        except Exception:
-            return HttpResponseServerError(
-                traceback.format_exc() if settings.DEBUG else "Internal Server Error",
-                content_type="text/plain",
-            )
-
-    async def send_response(self, response, send):
-        """Encode and send a response out over ASGI."""
-        # Collect cookies into headers. Have to preserve header case as there
-        # are some non-RFC compliant clients that require e.g. Content-Type.
-        response_headers = []
-        for header, value in response.items():
-            if isinstance(header, str):
-                header = header.encode("ascii")
-            if isinstance(value, str):
-                value = value.encode("latin1")
-            response_headers.append((bytes(header), bytes(value)))
-        for c in response.cookies.values():
-            response_headers.append(
-                (b"Set-Cookie", c.output(header="").encode("ascii").strip())
-            )
-        # Initial response message.
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status_code,
-                "headers": response_headers,
-            }
-        )
-        # Streaming responses need to be pinned to their iterator.
-        if response.streaming:
-            # - Consume via `__aiter__` and not `streaming_content` directly, to
-            #   allow mapping of a sync iterator.
-            # - Use aclosing() when consuming aiter.
-            #   See https://github.com/python/cpython/commit/6e8dcda
-            async with aclosing(aiter(response)) as content:
-                async for part in content:
-                    for chunk, _ in self.chunk_bytes(part):
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                # Ignore "more" as there may be more parts; instead,
-                                # use an empty final closing message with False.
-                                "more_body": True,
-                            }
-                        )
-            # Final closing message.
-            await send({"type": "http.response.body"})
-        # Other responses just need chunking.
-        else:
-            # Yield chunks of response.
-            for chunk, last in self.chunk_bytes(response.content):
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": chunk,
-                        "more_body": not last,
-                    }
-                )
-        await sync_to_async(response.close, thread_sensitive=True)()
-
-    @classmethod
-    def chunk_bytes(cls, data):
-        """
-        Chunks some data up so it can be sent in reasonable size messages.
-        Yields (chunk, last_chunk) tuples.
-        """
-        position = 0
-        if not data:
-            yield data, True
-            return
-        while position < len(data):
-            yield (
-                data[position : position + cls.chunk_size],
-                (position + cls.chunk_size) >= len(data),
-            )
-            position += cls.chunk_size
-
-    def get_script_prefix(self, scope):
-        """
-        Return the script prefix to use from either the scope or a setting.
-        """
-        if settings.FORCE_SCRIPT_NAME:
-            return settings.FORCE_SCRIPT_NAME
-        return scope.get("root_path", "") or ""
+    return SentryASGIMixin

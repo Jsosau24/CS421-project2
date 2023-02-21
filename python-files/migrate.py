@@ -1,511 +1,241 @@
-import sys
-import time
-from importlib import import_module
-
-from django.apps import apps
-from django.core.management.base import BaseCommand, CommandError, no_translations
-from django.core.management.sql import emit_post_migrate_signal, emit_pre_migrate_signal
-from django.db import DEFAULT_DB_ALIAS, connections, router
-from django.db.migrations.autodetector import MigrationAutodetector
-from django.db.migrations.executor import MigrationExecutor
-from django.db.migrations.loader import AmbiguityError
-from django.db.migrations.state import ModelState, ProjectState
-from django.utils.module_loading import module_has_submodule
-from django.utils.text import Truncator
+import mailpile.security as security
+from mailpile.commands import Command
+from mailpile.config.defaults import APPVER
+from mailpile.i18n import gettext as _
+from mailpile.i18n import ngettext as _n
+from mailpile.mail_source.local import LocalMailSource
+from mailpile.plugins import PluginManager
+from mailpile.util import *
+from mailpile.vcard import *
 
 
-class Command(BaseCommand):
-    help = (
-        "Updates database schema. Manages both apps with migrations and those without."
-    )
-    requires_system_checks = []
+_plugins = PluginManager(builtin=__file__)
 
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--skip-checks",
-            action="store_true",
-            help="Skip system checks.",
-        )
-        parser.add_argument(
-            "app_label",
-            nargs="?",
-            help="App label of an application to synchronize the state.",
-        )
-        parser.add_argument(
-            "migration_name",
-            nargs="?",
-            help="Database state will be brought to the state after that "
-            'migration. Use the name "zero" to unapply all migrations.',
-        )
-        parser.add_argument(
-            "--noinput",
-            "--no-input",
-            action="store_false",
-            dest="interactive",
-            help="Tells Django to NOT prompt the user for input of any kind.",
-        )
-        parser.add_argument(
-            "--database",
-            default=DEFAULT_DB_ALIAS,
-            help=(
-                'Nominates a database to synchronize. Defaults to the "default" '
-                "database."
-            ),
-        )
-        parser.add_argument(
-            "--fake",
-            action="store_true",
-            help="Mark migrations as run without actually running them.",
-        )
-        parser.add_argument(
-            "--fake-initial",
-            action="store_true",
-            help=(
-                "Detect if tables already exist and fake-apply initial migrations if "
-                "so. Make sure that the current database schema matches your initial "
-                "migration before using this flag. Django will only check for an "
-                "existing table name."
-            ),
-        )
-        parser.add_argument(
-            "--plan",
-            action="store_true",
-            help="Shows a list of the migration actions that will be performed.",
-        )
-        parser.add_argument(
-            "--run-syncdb",
-            action="store_true",
-            help="Creates tables for apps without migrations.",
-        )
-        parser.add_argument(
-            "--check",
-            action="store_true",
-            dest="check_unapplied",
-            help=(
-                "Exits with a non-zero status if unapplied migrations exist and does "
-                "not actually apply migrations."
-            ),
-        )
-        parser.add_argument(
-            "--prune",
-            action="store_true",
-            dest="prune",
-            help="Delete nonexistent migrations from the django_migrations table.",
-        )
+# We might want to do this differently at some point, but
+# for now it's fine.
 
-    @no_translations
-    def handle(self, *args, **options):
-        database = options["database"]
-        if not options["skip_checks"]:
-            self.check(databases=[database])
 
-        self.verbosity = options["verbosity"]
-        self.interactive = options["interactive"]
+def migrate_routes(session):
+    # Migration from route string to messageroute structure
+    def route_parse(route):
+        if route.startswith('|'):
+            command = route[1:].strip()
+            return {
+                "name": command.split()[0],
+                "protocol": "local",
+                "command": command
+            }
+        else:
+            res = re.split(
+                "([\w]+)://([^:]+):([^@]+)@([\w\d.]+):([\d]+)[/]{0,1}", route)
+            if len(res) >= 5:
+                return {
+                    "name": _("%(user)s on %(host)s"
+                              ) % {"user": res[2], "host": res[4]},
+                    "protocol": res[1],
+                    "username": res[2],
+                    "password": res[3],
+                    "host": res[4],
+                    "port": res[5]
+                }
+            else:
+                session.ui.warning(_('Could not migrate route: %s') % route)
+        return None
 
-        # Import the 'management' module within each installed app, to register
-        # dispatcher events.
-        for app_config in apps.get_app_configs():
-            if module_has_submodule(app_config.module, "management"):
-                import_module(".management", app_config.name)
+    def make_route_name(route_dict):
+        # This will always return the same hash, no matter how Python
+        # decides to order the dict internally.
+        return md5_hex(str(sorted(list(route_dict.iteritems()))))[:8]
 
-        # Get the database we're operating from
-        connection = connections[database]
+    if session.config.prefs.get('default_route'):
+        route_dict = route_parse(session.config.prefs.default_route)
+        if route_dict:
+            route_name = make_route_name(route_dict)
+            session.config.routes[route_name] = route_dict
+            session.config.prefs.default_messageroute = route_name
 
-        # Hook for backends needing any database preparation
-        connection.prepare_database()
-        # Work out which apps have migrations and which do not
-        executor = MigrationExecutor(connection, self.migration_progress_callback)
+    return True
 
-        # Raise an error if any migrations are applied before their dependencies.
-        executor.loader.check_consistent_history(connection)
 
-        # Before anything else, see if there's conflicting apps and drop out
-        # hard if there are any
-        conflicts = executor.loader.detect_conflicts()
-        if conflicts:
-            name_str = "; ".join(
-                "%s in %s" % (", ".join(names), app) for app, names in conflicts.items()
-            )
-            raise CommandError(
-                "Conflicting migrations detected; multiple leaf nodes in the "
-                "migration graph: (%s).\nTo fix them run "
-                "'python manage.py makemigrations --merge'" % name_str
-            )
+def migrate_mailboxes(session):
+    config = session.config
 
-        # If they supplied command line arguments, work out what they mean.
-        run_syncdb = options["run_syncdb"]
-        target_app_labels_only = True
-        if options["app_label"]:
-            # Validate app_label.
-            app_label = options["app_label"]
+    # FIXME: This should be using mailpile.vfs.FilePath
+    # FIXME: Link new mail sources to a profile... any profile?
+
+    def _common_path(paths):
+        common_head, junk = os.path.split(paths[0])
+        for path in paths:
+            head, junk = os.path.split(path)
+            while (common_head and common_head != '/' and
+                   head and head != '/' and
+                   head != common_head):
+                # First we try shortening the target path...
+                while head and head != '/' and head != common_head:
+                    head, junk = os.path.split(head)
+                # If that failed, lop one off the common path and try again
+                if head != common_head:
+                    common_head, junk = os.path.split(common_head)
+                    head, junk = os.path.split(path)
+        return common_head
+
+    mailboxes = []
+    thunderbird = []
+
+    spam_tids = [tag._key for tag in config.get_tags(type='spam')]
+    trash_tids = [tag._key for tag in config.get_tags(type='trash')]
+    inbox_tids = [tag._key for tag in config.get_tags(type='inbox')]
+
+    # Iterate through config.sys.mailbox, sort mailboxes by type
+    for mbx_id, path, src in config.get_mailboxes(with_mail_source=False):
+        if (path.startswith('src:') or
+                config.is_editable_mailbox(mbx_id)):
+            continue
+        elif 'thunderbird' in path.lower():
+            thunderbird.append((mbx_id, path))
+        else:
+            mailboxes.append((mbx_id, path))
+
+    if thunderbird:
+        # Create basic mail source...
+        if 'tbird' not in config.sources:
+            config.sources['tbird'] = {
+                'name': 'Thunderbird',
+                'protocol': 'mbox',
+            }
+            config.sources.tbird.discovery.create_tag = True
+
+        config.sources.tbird.discovery.policy = 'read'
+        config.sources.tbird.discovery.process_new = True
+        tbird_src = LocalMailSource(session, config.sources.tbird)
+
+        # Configure discovery policy?
+        root = _common_path([path for mbx_id, path in thunderbird])
+        if 'thunderbird' in root.lower():
+            # FIXME: This is wrong, we should create a mailbox entry
+            #        with the policy 'watch'.
+            tbird_src.my_config.discovery.path = root
+
+        # Take over all the mailboxes
+        for mbx_id, path in thunderbird:
+            mbx = tbird_src.take_over_mailbox(mbx_id)
+            if 'inbox' in path.lower():
+                mbx.apply_tags.extend(inbox_tids)
+            elif 'spam' in path.lower() or 'junk' in path.lower():
+                mbx.apply_tags.extend(spam_tids)
+            elif 'trash' in path.lower():
+                mbx.apply_tags.extend(trash_tids)
+
+        tbird_src.my_config.discovery.policy = 'unknown'
+
+    for name, proto, description, cls in (
+        ('mboxes', 'local', 'Local mailboxes', LocalMailSource),
+    ):
+        if mailboxes:
+            # Create basic mail source...
+            if name not in config.sources:
+                config.sources[name] = {
+                    'name': description,
+                    'protocol': proto
+                }
+                config.sources[name].discovery.create_tag = False
+            config.sources[name].discovery.policy = 'read'
+            config.sources[name].discovery.process_new = True
+            config.sources[name].discovery.apply_tags = inbox_tids[:]
+            src = cls(session, config.sources[name])
+            for mbx_id, path in mailboxes:
+                mbx = src.take_over_mailbox(mbx_id)
+            config.sources[name].discovery.policy = 'unknown'
+
+    return True
+
+
+def migrate_cleanup(session):
+    config = session.config
+
+    # Clean the autotaggers
+    autotaggers = [t for t in config.prefs.autotag.values() if t.tagger]
+    config.prefs.autotag = autotaggers
+
+    # Clean the vcards:
+    #   - Prefer vcards with valid key info
+    #   - De-dupe everything based on name/email combinations
+    def cardprint(vc):
+        emails = set([v.value for v in vc.get_all('email')])
+        return '/'.join([vc.fn] + sorted(list(emails)))
+    vcards = all_vcards = set(config.vcards.values())
+    keepers = set()
+    for vc in vcards:
+        keys = vc.get_all('key')
+        for k in keys:
             try:
-                apps.get_app_config(app_label)
-            except LookupError as err:
-                raise CommandError(str(err))
-            if run_syncdb:
-                if app_label in executor.loader.migrated_apps:
-                    raise CommandError(
-                        "Can't use run_syncdb with app '%s' as it has migrations."
-                        % app_label
-                    )
-            elif app_label not in executor.loader.migrated_apps:
-                raise CommandError("App '%s' does not have migrations." % app_label)
+                mime, fp = k.value.split('data:')[1].split(',')
+                if fp:
+                    keepers.add(vc)
+            except (ValueError, IndexError):
+                pass
+    for p in (1, 2):
+        prints = set([cardprint(vc) for vc in keepers])
+        for vc in vcards:
+            cp = cardprint(vc)
+            if cp not in prints:
+                keepers.add(vc)
+                prints.add(cp)
+        vcards = keepers
+        keepers = set()
+    # Deleted!!
+    config.vcards.del_vcards(*list(all_vcards - vcards))
 
-        if options["app_label"] and options["migration_name"]:
-            migration_name = options["migration_name"]
-            if migration_name == "zero":
-                targets = [(app_label, None)]
+    return True
+
+
+MIGRATIONS_BEFORE_SETUP = [migrate_routes]
+MIGRATIONS_AFTER_SETUP = [migrate_cleanup]
+MIGRATIONS = {
+    'routes': migrate_routes,
+    'sources': migrate_mailboxes,
+    'cleanup': migrate_cleanup
+}
+
+
+class Migrate(Command):
+    """Perform any needed migrations"""
+    SYNOPSIS = (None, 'setup/migrate', None,
+                '[' + '|'.join(sorted(MIGRATIONS.keys())) + ']')
+    ORDER = ('Internals', 0)
+    COMMAND_SECURITY = security.CC_CHANGE_CONFIG
+
+    def command(self, before_setup=True, after_setup=True):
+        session = self.session
+        err = cnt = 0
+
+        migrations = []
+        for a in self.args:
+            if a in MIGRATIONS:
+                migrations.append(MIGRATIONS[a])
             else:
-                try:
-                    migration = executor.loader.get_migration_by_prefix(
-                        app_label, migration_name
-                    )
-                except AmbiguityError:
-                    raise CommandError(
-                        "More than one migration matches '%s' in app '%s'. "
-                        "Please be more specific." % (migration_name, app_label)
-                    )
-                except KeyError:
-                    raise CommandError(
-                        "Cannot find a migration matching '%s' from app '%s'."
-                        % (migration_name, app_label)
-                    )
-                target = (app_label, migration.name)
-                # Partially applied squashed migrations are not included in the
-                # graph, use the last replacement instead.
-                if (
-                    target not in executor.loader.graph.nodes
-                    and target in executor.loader.replacements
-                ):
-                    incomplete_migration = executor.loader.replacements[target]
-                    target = incomplete_migration.replaces[-1]
-                targets = [target]
-            target_app_labels_only = False
-        elif options["app_label"]:
-            targets = [
-                key for key in executor.loader.graph.leaf_nodes() if key[0] == app_label
-            ]
-        else:
-            targets = executor.loader.graph.leaf_nodes()
+                raise UsageError(_('Unknown migration: %s (available: %s)'
+                                   ) % (a, ', '.join(MIGRATIONS.keys())))
 
-        if options["prune"]:
-            if not options["app_label"]:
-                raise CommandError(
-                    "Migrations can be pruned only when an app is specified."
-                )
-            if self.verbosity > 0:
-                self.stdout.write("Pruning migrations:", self.style.MIGRATE_HEADING)
-            to_prune = set(executor.loader.applied_migrations) - set(
-                executor.loader.disk_migrations
-            )
-            squashed_migrations_with_deleted_replaced_migrations = [
-                migration_key
-                for migration_key, migration_obj in executor.loader.replacements.items()
-                if any(replaced in to_prune for replaced in migration_obj.replaces)
-            ]
-            if squashed_migrations_with_deleted_replaced_migrations:
-                self.stdout.write(
-                    self.style.NOTICE(
-                        "  Cannot use --prune because the following squashed "
-                        "migrations have their 'replaces' attributes and may not "
-                        "be recorded as applied:"
-                    )
-                )
-                for migration in squashed_migrations_with_deleted_replaced_migrations:
-                    app, name = migration
-                    self.stdout.write(f"    {app}.{name}")
-                self.stdout.write(
-                    self.style.NOTICE(
-                        "  Re-run 'manage.py migrate' if they are not marked as "
-                        "applied, and remove 'replaces' attributes in their "
-                        "Migration classes."
-                    )
-                )
-            else:
-                to_prune = sorted(
-                    migration for migration in to_prune if migration[0] == app_label
-                )
-                if to_prune:
-                    for migration in to_prune:
-                        app, name = migration
-                        if self.verbosity > 0:
-                            self.stdout.write(
-                                self.style.MIGRATE_LABEL(f"  Pruning {app}.{name}"),
-                                ending="",
-                            )
-                        executor.recorder.record_unapplied(app, name)
-                        if self.verbosity > 0:
-                            self.stdout.write(self.style.SUCCESS(" OK"))
-                elif self.verbosity > 0:
-                    self.stdout.write("  No migrations to prune.")
+        if not migrations:
+            migrations = ((before_setup and MIGRATIONS_BEFORE_SETUP or []) +
+                          (after_setup and MIGRATIONS_AFTER_SETUP or []))
 
-        plan = executor.migration_plan(targets)
-
-        if options["plan"]:
-            self.stdout.write("Planned operations:", self.style.MIGRATE_LABEL)
-            if not plan:
-                self.stdout.write("  No planned migration operations.")
-            else:
-                for migration, backwards in plan:
-                    self.stdout.write(str(migration), self.style.MIGRATE_HEADING)
-                    for operation in migration.operations:
-                        message, is_error = self.describe_operation(
-                            operation, backwards
-                        )
-                        style = self.style.WARNING if is_error else None
-                        self.stdout.write("    " + message, style)
-                if options["check_unapplied"]:
-                    sys.exit(1)
-            return
-        if options["check_unapplied"]:
-            if plan:
-                sys.exit(1)
-            return
-        if options["prune"]:
-            return
-
-        # At this point, ignore run_syncdb if there aren't any apps to sync.
-        run_syncdb = options["run_syncdb"] and executor.loader.unmigrated_apps
-        # Print some useful info
-        if self.verbosity >= 1:
-            self.stdout.write(self.style.MIGRATE_HEADING("Operations to perform:"))
-            if run_syncdb:
-                if options["app_label"]:
-                    self.stdout.write(
-                        self.style.MIGRATE_LABEL(
-                            "  Synchronize unmigrated app: %s" % app_label
-                        )
-                    )
+        for mig in migrations:
+            try:
+                if mig(session):
+                    cnt += 1
                 else:
-                    self.stdout.write(
-                        self.style.MIGRATE_LABEL("  Synchronize unmigrated apps: ")
-                        + (", ".join(sorted(executor.loader.unmigrated_apps)))
-                    )
-            if target_app_labels_only:
-                self.stdout.write(
-                    self.style.MIGRATE_LABEL("  Apply all migrations: ")
-                    + (", ".join(sorted({a for a, n in targets})) or "(none)")
-                )
-            else:
-                if targets[0][1] is None:
-                    self.stdout.write(
-                        self.style.MIGRATE_LABEL("  Unapply all migrations: ")
-                        + str(targets[0][0])
-                    )
-                else:
-                    self.stdout.write(
-                        self.style.MIGRATE_LABEL("  Target specific migration: ")
-                        + "%s, from %s" % (targets[0][1], targets[0][0])
-                    )
+                    err += 1
+            except:
+                self._ignore_exception()
+                err += 1
 
-        pre_migrate_state = executor._create_project_state(with_applied_migrations=True)
-        pre_migrate_apps = pre_migrate_state.apps
-        emit_pre_migrate_signal(
-            self.verbosity,
-            self.interactive,
-            connection.alias,
-            stdout=self.stdout,
-            apps=pre_migrate_apps,
-            plan=plan,
-        )
+        self.session.config.version = APPVER  # We've migrated to this!
 
-        # Run the syncdb phase.
-        if run_syncdb:
-            if self.verbosity >= 1:
-                self.stdout.write(
-                    self.style.MIGRATE_HEADING("Synchronizing apps without migrations:")
-                )
-            if options["app_label"]:
-                self.sync_apps(connection, [app_label])
-            else:
-                self.sync_apps(connection, executor.loader.unmigrated_apps)
+        self._background_save(config=True)
+        return self._success(_('Performed %d migrations, failed %d.'
+                               ) % (cnt, err))
 
-        # Migrate!
-        if self.verbosity >= 1:
-            self.stdout.write(self.style.MIGRATE_HEADING("Running migrations:"))
-        if not plan:
-            if self.verbosity >= 1:
-                self.stdout.write("  No migrations to apply.")
-                # If there's changes that aren't in migrations yet, tell them
-                # how to fix it.
-                autodetector = MigrationAutodetector(
-                    executor.loader.project_state(),
-                    ProjectState.from_apps(apps),
-                )
-                changes = autodetector.changes(graph=executor.loader.graph)
-                if changes:
-                    self.stdout.write(
-                        self.style.NOTICE(
-                            "  Your models in app(s): %s have changes that are not "
-                            "yet reflected in a migration, and so won't be "
-                            "applied." % ", ".join(repr(app) for app in sorted(changes))
-                        )
-                    )
-                    self.stdout.write(
-                        self.style.NOTICE(
-                            "  Run 'manage.py makemigrations' to make new "
-                            "migrations, and then re-run 'manage.py migrate' to "
-                            "apply them."
-                        )
-                    )
-            fake = False
-            fake_initial = False
-        else:
-            fake = options["fake"]
-            fake_initial = options["fake_initial"]
-        post_migrate_state = executor.migrate(
-            targets,
-            plan=plan,
-            state=pre_migrate_state.clone(),
-            fake=fake,
-            fake_initial=fake_initial,
-        )
-        # post_migrate signals have access to all models. Ensure that all models
-        # are reloaded in case any are delayed.
-        post_migrate_state.clear_delayed_apps_cache()
-        post_migrate_apps = post_migrate_state.apps
 
-        # Re-render models of real apps to include relationships now that
-        # we've got a final state. This wouldn't be necessary if real apps
-        # models were rendered with relationships in the first place.
-        with post_migrate_apps.bulk_update():
-            model_keys = []
-            for model_state in post_migrate_apps.real_models:
-                model_key = model_state.app_label, model_state.name_lower
-                model_keys.append(model_key)
-                post_migrate_apps.unregister_model(*model_key)
-        post_migrate_apps.render_multiple(
-            [ModelState.from_model(apps.get_model(*model)) for model in model_keys]
-        )
-
-        # Send the post_migrate signal, so individual apps can do whatever they need
-        # to do at this point.
-        emit_post_migrate_signal(
-            self.verbosity,
-            self.interactive,
-            connection.alias,
-            stdout=self.stdout,
-            apps=post_migrate_apps,
-            plan=plan,
-        )
-
-    def migration_progress_callback(self, action, migration=None, fake=False):
-        if self.verbosity >= 1:
-            compute_time = self.verbosity > 1
-            if action == "apply_start":
-                if compute_time:
-                    self.start = time.monotonic()
-                self.stdout.write("  Applying %s..." % migration, ending="")
-                self.stdout.flush()
-            elif action == "apply_success":
-                elapsed = (
-                    " (%.3fs)" % (time.monotonic() - self.start) if compute_time else ""
-                )
-                if fake:
-                    self.stdout.write(self.style.SUCCESS(" FAKED" + elapsed))
-                else:
-                    self.stdout.write(self.style.SUCCESS(" OK" + elapsed))
-            elif action == "unapply_start":
-                if compute_time:
-                    self.start = time.monotonic()
-                self.stdout.write("  Unapplying %s..." % migration, ending="")
-                self.stdout.flush()
-            elif action == "unapply_success":
-                elapsed = (
-                    " (%.3fs)" % (time.monotonic() - self.start) if compute_time else ""
-                )
-                if fake:
-                    self.stdout.write(self.style.SUCCESS(" FAKED" + elapsed))
-                else:
-                    self.stdout.write(self.style.SUCCESS(" OK" + elapsed))
-            elif action == "render_start":
-                if compute_time:
-                    self.start = time.monotonic()
-                self.stdout.write("  Rendering model states...", ending="")
-                self.stdout.flush()
-            elif action == "render_success":
-                elapsed = (
-                    " (%.3fs)" % (time.monotonic() - self.start) if compute_time else ""
-                )
-                self.stdout.write(self.style.SUCCESS(" DONE" + elapsed))
-
-    def sync_apps(self, connection, app_labels):
-        """Run the old syncdb-style operation on a list of app_labels."""
-        with connection.cursor() as cursor:
-            tables = connection.introspection.table_names(cursor)
-
-        # Build the manifest of apps and models that are to be synchronized.
-        all_models = [
-            (
-                app_config.label,
-                router.get_migratable_models(
-                    app_config, connection.alias, include_auto_created=False
-                ),
-            )
-            for app_config in apps.get_app_configs()
-            if app_config.models_module is not None and app_config.label in app_labels
-        ]
-
-        def model_installed(model):
-            opts = model._meta
-            converter = connection.introspection.identifier_converter
-            return not (
-                (converter(opts.db_table) in tables)
-                or (
-                    opts.auto_created
-                    and converter(opts.auto_created._meta.db_table) in tables
-                )
-            )
-
-        manifest = {
-            app_name: list(filter(model_installed, model_list))
-            for app_name, model_list in all_models
-        }
-
-        # Create the tables for each model
-        if self.verbosity >= 1:
-            self.stdout.write("  Creating tables...")
-        with connection.schema_editor() as editor:
-            for app_name, model_list in manifest.items():
-                for model in model_list:
-                    # Never install unmanaged models, etc.
-                    if not model._meta.can_migrate(connection):
-                        continue
-                    if self.verbosity >= 3:
-                        self.stdout.write(
-                            "    Processing %s.%s model"
-                            % (app_name, model._meta.object_name)
-                        )
-                    if self.verbosity >= 1:
-                        self.stdout.write(
-                            "    Creating table %s" % model._meta.db_table
-                        )
-                    editor.create_model(model)
-
-            # Deferred SQL is executed when exiting the editor's context.
-            if self.verbosity >= 1:
-                self.stdout.write("    Running deferred SQL...")
-
-    @staticmethod
-    def describe_operation(operation, backwards):
-        """Return a string that describes a migration operation for --plan."""
-        prefix = ""
-        is_error = False
-        if hasattr(operation, "code"):
-            code = operation.reverse_code if backwards else operation.code
-            action = (code.__doc__ or "") if code else None
-        elif hasattr(operation, "sql"):
-            action = operation.reverse_sql if backwards else operation.sql
-        else:
-            action = ""
-            if backwards:
-                prefix = "Undo "
-        if action is not None:
-            action = str(action).replace("\n", "")
-        elif backwards:
-            action = "IRREVERSIBLE"
-            is_error = True
-        if action:
-            action = " -> " + action
-        truncated = Truncator(action)
-        return prefix + operation.describe() + truncated.chars(40), is_error
+_plugins.register_commands(Migrate)

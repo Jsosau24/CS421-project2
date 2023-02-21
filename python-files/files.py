@@ -1,510 +1,543 @@
-import datetime
-import posixpath
+"""
+Files Pipeline
 
-from django import forms
-from django.core import checks
-from django.core.files.base import File
-from django.core.files.images import ImageFile
-from django.core.files.storage import Storage, default_storage
-from django.core.files.utils import validate_file_name
-from django.db.models import signals
-from django.db.models.fields import Field
-from django.db.models.query_utils import DeferredAttribute
-from django.db.models.utils import AltersData
-from django.utils.translation import gettext_lazy as _
+See documentation in topics/media-pipeline.rst
+"""
+import functools
+import hashlib
+import logging
+import mimetypes
+import os
+import time
+from collections import defaultdict
+from contextlib import suppress
+from ftplib import FTP
+from io import BytesIO
+from pathlib import Path
+from typing import DefaultDict, Optional, Set
+from urllib.parse import urlparse
+
+from itemadapter import ItemAdapter
+from twisted.internet import defer, threads
+
+from scrapy.exceptions import IgnoreRequest, NotConfigured
+from scrapy.http import Request
+from scrapy.http.request import NO_CALLBACK
+from scrapy.pipelines.media import MediaPipeline
+from scrapy.settings import Settings
+from scrapy.utils.boto import is_botocore_available
+from scrapy.utils.datatypes import CaselessDict
+from scrapy.utils.ftp import ftp_store_file
+from scrapy.utils.log import failure_to_exc_info
+from scrapy.utils.misc import md5sum
+from scrapy.utils.python import to_bytes
+from scrapy.utils.request import referer_str
+
+logger = logging.getLogger(__name__)
 
 
-class FieldFile(File, AltersData):
-    def __init__(self, instance, field, name):
-        super().__init__(None, name)
-        self.instance = instance
-        self.field = field
-        self.storage = field.storage
-        self._committed = True
+class FileException(Exception):
+    """General media error exception"""
 
-    def __eq__(self, other):
-        # Older code may be expecting FileField values to be simple strings.
-        # By overriding the == operator, it can remain backwards compatibility.
-        if hasattr(other, "name"):
-            return self.name == other.name
-        return self.name == other
 
-    def __hash__(self):
-        return hash(self.name)
+class FSFilesStore:
+    def __init__(self, basedir: str):
+        if "://" in basedir:
+            basedir = basedir.split("://", 1)[1]
+        self.basedir = basedir
+        self._mkdir(Path(self.basedir))
+        self.created_directories: DefaultDict[str, Set[str]] = defaultdict(set)
 
-    # The standard File contains most of the necessary properties, but
-    # FieldFiles can be instantiated without a name, so that needs to
-    # be checked for here.
+    def persist_file(self, path: str, buf, info, meta=None, headers=None):
+        absolute_path = self._get_filesystem_path(path)
+        self._mkdir(absolute_path.parent, info)
+        absolute_path.write_bytes(buf.getvalue())
 
-    def _require_file(self):
-        if not self:
-            raise ValueError(
-                "The '%s' attribute has no file associated with it." % self.field.name
+    def stat_file(self, path: str, info):
+        absolute_path = self._get_filesystem_path(path)
+        try:
+            last_modified = absolute_path.stat().st_mtime
+        except os.error:
+            return {}
+
+        with absolute_path.open("rb") as f:
+            checksum = md5sum(f)
+
+        return {"last_modified": last_modified, "checksum": checksum}
+
+    def _get_filesystem_path(self, path: str) -> Path:
+        path_comps = path.split("/")
+        return Path(self.basedir, *path_comps)
+
+    def _mkdir(self, dirname: Path, domain: Optional[str] = None):
+        seen = self.created_directories[domain] if domain else set()
+        if str(dirname) not in seen:
+            if not dirname.exists():
+                dirname.mkdir(parents=True)
+            seen.add(str(dirname))
+
+
+class S3FilesStore:
+    AWS_ACCESS_KEY_ID = None
+    AWS_SECRET_ACCESS_KEY = None
+    AWS_SESSION_TOKEN = None
+    AWS_ENDPOINT_URL = None
+    AWS_REGION_NAME = None
+    AWS_USE_SSL = None
+    AWS_VERIFY = None
+
+    POLICY = "private"  # Overridden from settings.FILES_STORE_S3_ACL in FilesPipeline.from_settings
+    HEADERS = {
+        "Cache-Control": "max-age=172800",
+    }
+
+    def __init__(self, uri):
+        if not is_botocore_available():
+            raise NotConfigured("missing botocore library")
+        import botocore.session
+
+        session = botocore.session.get_session()
+        self.s3_client = session.create_client(
+            "s3",
+            aws_access_key_id=self.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=self.AWS_SECRET_ACCESS_KEY,
+            aws_session_token=self.AWS_SESSION_TOKEN,
+            endpoint_url=self.AWS_ENDPOINT_URL,
+            region_name=self.AWS_REGION_NAME,
+            use_ssl=self.AWS_USE_SSL,
+            verify=self.AWS_VERIFY,
+        )
+        if not uri.startswith("s3://"):
+            raise ValueError(f"Incorrect URI scheme in {uri}, expected 's3'")
+        self.bucket, self.prefix = uri[5:].split("/", 1)
+
+    def stat_file(self, path, info):
+        def _onsuccess(boto_key):
+            checksum = boto_key["ETag"].strip('"')
+            last_modified = boto_key["LastModified"]
+            modified_stamp = time.mktime(last_modified.timetuple())
+            return {"checksum": checksum, "last_modified": modified_stamp}
+
+        return self._get_boto_key(path).addCallback(_onsuccess)
+
+    def _get_boto_key(self, path):
+        key_name = f"{self.prefix}{path}"
+        return threads.deferToThread(
+            self.s3_client.head_object, Bucket=self.bucket, Key=key_name
+        )
+
+    def persist_file(self, path, buf, info, meta=None, headers=None):
+        """Upload file to S3 storage"""
+        key_name = f"{self.prefix}{path}"
+        buf.seek(0)
+        extra = self._headers_to_botocore_kwargs(self.HEADERS)
+        if headers:
+            extra.update(self._headers_to_botocore_kwargs(headers))
+        return threads.deferToThread(
+            self.s3_client.put_object,
+            Bucket=self.bucket,
+            Key=key_name,
+            Body=buf,
+            Metadata={k: str(v) for k, v in (meta or {}).items()},
+            ACL=self.POLICY,
+            **extra,
+        )
+
+    def _headers_to_botocore_kwargs(self, headers):
+        """Convert headers to botocore keyword arguments."""
+        # This is required while we need to support both boto and botocore.
+        mapping = CaselessDict(
+            {
+                "Content-Type": "ContentType",
+                "Cache-Control": "CacheControl",
+                "Content-Disposition": "ContentDisposition",
+                "Content-Encoding": "ContentEncoding",
+                "Content-Language": "ContentLanguage",
+                "Content-Length": "ContentLength",
+                "Content-MD5": "ContentMD5",
+                "Expires": "Expires",
+                "X-Amz-Grant-Full-Control": "GrantFullControl",
+                "X-Amz-Grant-Read": "GrantRead",
+                "X-Amz-Grant-Read-ACP": "GrantReadACP",
+                "X-Amz-Grant-Write-ACP": "GrantWriteACP",
+                "X-Amz-Object-Lock-Legal-Hold": "ObjectLockLegalHoldStatus",
+                "X-Amz-Object-Lock-Mode": "ObjectLockMode",
+                "X-Amz-Object-Lock-Retain-Until-Date": "ObjectLockRetainUntilDate",
+                "X-Amz-Request-Payer": "RequestPayer",
+                "X-Amz-Server-Side-Encryption": "ServerSideEncryption",
+                "X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "SSEKMSKeyId",
+                "X-Amz-Server-Side-Encryption-Context": "SSEKMSEncryptionContext",
+                "X-Amz-Server-Side-Encryption-Customer-Algorithm": "SSECustomerAlgorithm",
+                "X-Amz-Server-Side-Encryption-Customer-Key": "SSECustomerKey",
+                "X-Amz-Server-Side-Encryption-Customer-Key-Md5": "SSECustomerKeyMD5",
+                "X-Amz-Storage-Class": "StorageClass",
+                "X-Amz-Tagging": "Tagging",
+                "X-Amz-Website-Redirect-Location": "WebsiteRedirectLocation",
+            }
+        )
+        extra = {}
+        for key, value in headers.items():
+            try:
+                kwarg = mapping[key]
+            except KeyError:
+                raise TypeError(f'Header "{key}" is not supported by botocore')
+            else:
+                extra[kwarg] = value
+        return extra
+
+
+class GCSFilesStore:
+    GCS_PROJECT_ID = None
+
+    CACHE_CONTROL = "max-age=172800"
+
+    # The bucket's default object ACL will be applied to the object.
+    # Overridden from settings.FILES_STORE_GCS_ACL in FilesPipeline.from_settings.
+    POLICY = None
+
+    def __init__(self, uri):
+        from google.cloud import storage
+
+        client = storage.Client(project=self.GCS_PROJECT_ID)
+        bucket, prefix = uri[5:].split("/", 1)
+        self.bucket = client.bucket(bucket)
+        self.prefix = prefix
+        permissions = self.bucket.test_iam_permissions(
+            ["storage.objects.get", "storage.objects.create"]
+        )
+        if "storage.objects.get" not in permissions:
+            logger.warning(
+                "No 'storage.objects.get' permission for GSC bucket %(bucket)s. "
+                "Checking if files are up to date will be impossible. Files will be downloaded every time.",
+                {"bucket": bucket},
+            )
+        if "storage.objects.create" not in permissions:
+            logger.error(
+                "No 'storage.objects.create' permission for GSC bucket %(bucket)s. Saving files will be impossible!",
+                {"bucket": bucket},
             )
 
-    def _get_file(self):
-        self._require_file()
-        if getattr(self, "_file", None) is None:
-            self._file = self.storage.open(self.name, "rb")
-        return self._file
+    def stat_file(self, path, info):
+        def _onsuccess(blob):
+            if blob:
+                checksum = blob.md5_hash
+                last_modified = time.mktime(blob.updated.timetuple())
+                return {"checksum": checksum, "last_modified": last_modified}
+            return {}
 
-    def _set_file(self, file):
-        self._file = file
+        blob_path = self._get_blob_path(path)
+        return threads.deferToThread(self.bucket.get_blob, blob_path).addCallback(
+            _onsuccess
+        )
 
-    def _del_file(self):
-        del self._file
+    def _get_content_type(self, headers):
+        if headers and "Content-Type" in headers:
+            return headers["Content-Type"]
+        return "application/octet-stream"
 
-    file = property(_get_file, _set_file, _del_file)
+    def _get_blob_path(self, path):
+        return self.prefix + path
 
-    @property
-    def path(self):
-        self._require_file()
-        return self.storage.path(self.name)
+    def persist_file(self, path, buf, info, meta=None, headers=None):
+        blob_path = self._get_blob_path(path)
+        blob = self.bucket.blob(blob_path)
+        blob.cache_control = self.CACHE_CONTROL
+        blob.metadata = {k: str(v) for k, v in (meta or {}).items()}
+        return threads.deferToThread(
+            blob.upload_from_string,
+            data=buf.getvalue(),
+            content_type=self._get_content_type(headers),
+            predefined_acl=self.POLICY,
+        )
 
-    @property
-    def url(self):
-        self._require_file()
-        return self.storage.url(self.name)
 
-    @property
-    def size(self):
-        self._require_file()
-        if not self._committed:
-            return self.file.size
-        return self.storage.size(self.name)
+class FTPFilesStore:
+    FTP_USERNAME = None
+    FTP_PASSWORD = None
+    USE_ACTIVE_MODE = None
 
-    def open(self, mode="rb"):
-        self._require_file()
-        if getattr(self, "_file", None) is None:
-            self.file = self.storage.open(self.name, mode)
+    def __init__(self, uri):
+        if not uri.startswith("ftp://"):
+            raise ValueError(f"Incorrect URI scheme in {uri}, expected 'ftp'")
+        u = urlparse(uri)
+        self.port = u.port
+        self.host = u.hostname
+        self.port = int(u.port or 21)
+        self.username = u.username or self.FTP_USERNAME
+        self.password = u.password or self.FTP_PASSWORD
+        self.basedir = u.path.rstrip("/")
+
+    def persist_file(self, path, buf, info, meta=None, headers=None):
+        path = f"{self.basedir}/{path}"
+        return threads.deferToThread(
+            ftp_store_file,
+            path=path,
+            file=buf,
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            use_active_mode=self.USE_ACTIVE_MODE,
+        )
+
+    def stat_file(self, path, info):
+        def _stat_file(path):
+            try:
+                ftp = FTP()
+                ftp.connect(self.host, self.port)
+                ftp.login(self.username, self.password)
+                if self.USE_ACTIVE_MODE:
+                    ftp.set_pasv(False)
+                file_path = f"{self.basedir}/{path}"
+                last_modified = float(ftp.voidcmd(f"MDTM {file_path}")[4:].strip())
+                m = hashlib.md5()
+                ftp.retrbinary(f"RETR {file_path}", m.update)
+                return {"last_modified": last_modified, "checksum": m.hexdigest()}
+            # The file doesn't exist
+            except Exception:
+                return {}
+
+        return threads.deferToThread(_stat_file, path)
+
+
+class FilesPipeline(MediaPipeline):
+    """Abstract pipeline that implement the file downloading
+
+    This pipeline tries to minimize network transfers and file processing,
+    doing stat of the files and determining if file is new, up-to-date or
+    expired.
+
+    ``new`` files are those that pipeline never processed and needs to be
+        downloaded from supplier site the first time.
+
+    ``uptodate`` files are the ones that the pipeline processed and are still
+        valid files.
+
+    ``expired`` files are those that pipeline already processed but the last
+        modification was made long time ago, so a reprocessing is recommended to
+        refresh it in case of change.
+
+    """
+
+    MEDIA_NAME = "file"
+    EXPIRES = 90
+    STORE_SCHEMES = {
+        "": FSFilesStore,
+        "file": FSFilesStore,
+        "s3": S3FilesStore,
+        "gs": GCSFilesStore,
+        "ftp": FTPFilesStore,
+    }
+    DEFAULT_FILES_URLS_FIELD = "file_urls"
+    DEFAULT_FILES_RESULT_FIELD = "files"
+
+    def __init__(self, store_uri, download_func=None, settings=None):
+        if not store_uri:
+            raise NotConfigured
+
+        if isinstance(settings, dict) or settings is None:
+            settings = Settings(settings)
+
+        cls_name = "FilesPipeline"
+        self.store = self._get_store(store_uri)
+        resolve = functools.partial(
+            self._key_for_pipe, base_class_name=cls_name, settings=settings
+        )
+        self.expires = settings.getint(resolve("FILES_EXPIRES"), self.EXPIRES)
+        if not hasattr(self, "FILES_URLS_FIELD"):
+            self.FILES_URLS_FIELD = self.DEFAULT_FILES_URLS_FIELD
+        if not hasattr(self, "FILES_RESULT_FIELD"):
+            self.FILES_RESULT_FIELD = self.DEFAULT_FILES_RESULT_FIELD
+        self.files_urls_field = settings.get(
+            resolve("FILES_URLS_FIELD"), self.FILES_URLS_FIELD
+        )
+        self.files_result_field = settings.get(
+            resolve("FILES_RESULT_FIELD"), self.FILES_RESULT_FIELD
+        )
+
+        super().__init__(download_func=download_func, settings=settings)
+
+    @classmethod
+    def from_settings(cls, settings):
+        s3store = cls.STORE_SCHEMES["s3"]
+        s3store.AWS_ACCESS_KEY_ID = settings["AWS_ACCESS_KEY_ID"]
+        s3store.AWS_SECRET_ACCESS_KEY = settings["AWS_SECRET_ACCESS_KEY"]
+        s3store.AWS_SESSION_TOKEN = settings["AWS_SESSION_TOKEN"]
+        s3store.AWS_ENDPOINT_URL = settings["AWS_ENDPOINT_URL"]
+        s3store.AWS_REGION_NAME = settings["AWS_REGION_NAME"]
+        s3store.AWS_USE_SSL = settings["AWS_USE_SSL"]
+        s3store.AWS_VERIFY = settings["AWS_VERIFY"]
+        s3store.POLICY = settings["FILES_STORE_S3_ACL"]
+
+        gcs_store = cls.STORE_SCHEMES["gs"]
+        gcs_store.GCS_PROJECT_ID = settings["GCS_PROJECT_ID"]
+        gcs_store.POLICY = settings["FILES_STORE_GCS_ACL"] or None
+
+        ftp_store = cls.STORE_SCHEMES["ftp"]
+        ftp_store.FTP_USERNAME = settings["FTP_USER"]
+        ftp_store.FTP_PASSWORD = settings["FTP_PASSWORD"]
+        ftp_store.USE_ACTIVE_MODE = settings.getbool("FEED_STORAGE_FTP_ACTIVE")
+
+        store_uri = settings["FILES_STORE"]
+        return cls(store_uri, settings=settings)
+
+    def _get_store(self, uri: str):
+        if Path(uri).is_absolute():  # to support win32 paths like: C:\\some\dir
+            scheme = "file"
         else:
-            self.file.open(mode)
-        return self
+            scheme = urlparse(uri).scheme
+        store_cls = self.STORE_SCHEMES[scheme]
+        return store_cls(uri)
 
-    # open() doesn't alter the file's contents, but it does reset the pointer
-    open.alters_data = True
+    def media_to_download(self, request, info, *, item=None):
+        def _onsuccess(result):
+            if not result:
+                return  # returning None force download
 
-    # In addition to the standard File API, FieldFiles have extra methods
-    # to further manipulate the underlying file, as well as update the
-    # associated model instance.
+            last_modified = result.get("last_modified", None)
+            if not last_modified:
+                return  # returning None force download
 
-    def save(self, name, content, save=True):
-        name = self.field.generate_filename(self.instance, name)
-        self.name = self.storage.save(name, content, max_length=self.field.max_length)
-        setattr(self.instance, self.field.attname, self.name)
-        self._committed = True
+            age_seconds = time.time() - last_modified
+            age_days = age_seconds / 60 / 60 / 24
+            if age_days > self.expires:
+                return  # returning None force download
 
-        # Save the object because it has changed, unless save is False
-        if save:
-            self.instance.save()
+            referer = referer_str(request)
+            logger.debug(
+                "File (uptodate): Downloaded %(medianame)s from %(request)s "
+                "referred in <%(referer)s>",
+                {"medianame": self.MEDIA_NAME, "request": request, "referer": referer},
+                extra={"spider": info.spider},
+            )
+            self.inc_stats(info.spider, "uptodate")
 
-    save.alters_data = True
+            checksum = result.get("checksum", None)
+            return {
+                "url": request.url,
+                "path": path,
+                "checksum": checksum,
+                "status": "uptodate",
+            }
 
-    def delete(self, save=True):
-        if not self:
-            return
-        # Only close the file if it's already open, which we know by the
-        # presence of self._file
-        if hasattr(self, "_file"):
-            self.close()
-            del self.file
+        path = self.file_path(request, info=info, item=item)
+        dfd = defer.maybeDeferred(self.store.stat_file, path, info)
+        dfd.addCallbacks(_onsuccess, lambda _: None)
+        dfd.addErrback(
+            lambda f: logger.error(
+                self.__class__.__name__ + ".store.stat_file",
+                exc_info=failure_to_exc_info(f),
+                extra={"spider": info.spider},
+            )
+        )
+        return dfd
 
-        self.storage.delete(self.name)
+    def media_failed(self, failure, request, info):
+        if not isinstance(failure.value, IgnoreRequest):
+            referer = referer_str(request)
+            logger.warning(
+                "File (unknown-error): Error downloading %(medianame)s from "
+                "%(request)s referred in <%(referer)s>: %(exception)s",
+                {
+                    "medianame": self.MEDIA_NAME,
+                    "request": request,
+                    "referer": referer,
+                    "exception": failure.value,
+                },
+                extra={"spider": info.spider},
+            )
 
-        self.name = None
-        setattr(self.instance, self.field.attname, self.name)
-        self._committed = False
+        raise FileException
 
-        if save:
-            self.instance.save()
+    def media_downloaded(self, response, request, info, *, item=None):
+        referer = referer_str(request)
 
-    delete.alters_data = True
+        if response.status != 200:
+            logger.warning(
+                "File (code: %(status)s): Error downloading file from "
+                "%(request)s referred in <%(referer)s>",
+                {"status": response.status, "request": request, "referer": referer},
+                extra={"spider": info.spider},
+            )
+            raise FileException("download-error")
 
-    @property
-    def closed(self):
-        file = getattr(self, "_file", None)
-        return file is None or file.closed
+        if not response.body:
+            logger.warning(
+                "File (empty-content): Empty file from %(request)s referred "
+                "in <%(referer)s>: no-content",
+                {"request": request, "referer": referer},
+                extra={"spider": info.spider},
+            )
+            raise FileException("empty-content")
 
-    def close(self):
-        file = getattr(self, "_file", None)
-        if file is not None:
-            file.close()
+        status = "cached" if "cached" in response.flags else "downloaded"
+        logger.debug(
+            "File (%(status)s): Downloaded file from %(request)s referred in "
+            "<%(referer)s>",
+            {"status": status, "request": request, "referer": referer},
+            extra={"spider": info.spider},
+        )
+        self.inc_stats(info.spider, status)
 
-    def __getstate__(self):
-        # FieldFile needs access to its associated model field, an instance and
-        # the file's name. Everything else will be restored later, by
-        # FileDescriptor below.
+        try:
+            path = self.file_path(request, response=response, info=info, item=item)
+            checksum = self.file_downloaded(response, request, info, item=item)
+        except FileException as exc:
+            logger.warning(
+                "File (error): Error processing file from %(request)s "
+                "referred in <%(referer)s>: %(errormsg)s",
+                {"request": request, "referer": referer, "errormsg": str(exc)},
+                extra={"spider": info.spider},
+                exc_info=True,
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "File (unknown-error): Error processing file from %(request)s "
+                "referred in <%(referer)s>",
+                {"request": request, "referer": referer},
+                exc_info=True,
+                extra={"spider": info.spider},
+            )
+            raise FileException(str(exc))
+
         return {
-            "name": self.name,
-            "closed": False,
-            "_committed": True,
-            "_file": None,
-            "instance": self.instance,
-            "field": self.field,
+            "url": request.url,
+            "path": path,
+            "checksum": checksum,
+            "status": status,
         }
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self.storage = self.field.storage
+    def inc_stats(self, spider, status):
+        spider.crawler.stats.inc_value("file_count", spider=spider)
+        spider.crawler.stats.inc_value(f"file_status_count/{status}", spider=spider)
 
+    # Overridable Interface
+    def get_media_requests(self, item, info):
+        urls = ItemAdapter(item).get(self.files_urls_field, [])
+        return [Request(u, callback=NO_CALLBACK) for u in urls]
 
-class FileDescriptor(DeferredAttribute):
-    """
-    The descriptor for the file attribute on the model instance. Return a
-    FieldFile when accessed so you can write code like::
+    def file_downloaded(self, response, request, info, *, item=None):
+        path = self.file_path(request, response=response, info=info, item=item)
+        buf = BytesIO(response.body)
+        checksum = md5sum(buf)
+        buf.seek(0)
+        self.store.persist_file(path, buf, info)
+        return checksum
 
-        >>> from myapp.models import MyModel
-        >>> instance = MyModel.objects.get(pk=1)
-        >>> instance.file.size
+    def item_completed(self, results, item, info):
+        with suppress(KeyError):
+            ItemAdapter(item)[self.files_result_field] = [x for ok, x in results if ok]
+        return item
 
-    Assign a file object on assignment so you can do::
-
-        >>> with open('/path/to/hello.world') as f:
-        ...     instance.file = File(f)
-    """
-
-    def __get__(self, instance, cls=None):
-        if instance is None:
-            return self
-
-        # This is slightly complicated, so worth an explanation.
-        # instance.file needs to ultimately return some instance of `File`,
-        # probably a subclass. Additionally, this returned object needs to have
-        # the FieldFile API so that users can easily do things like
-        # instance.file.path and have that delegated to the file storage engine.
-        # Easy enough if we're strict about assignment in __set__, but if you
-        # peek below you can see that we're not. So depending on the current
-        # value of the field we have to dynamically construct some sort of
-        # "thing" to return.
-
-        # The instance dict contains whatever was originally assigned
-        # in __set__.
-        file = super().__get__(instance, cls)
-
-        # If this value is a string (instance.file = "path/to/file") or None
-        # then we simply wrap it with the appropriate attribute class according
-        # to the file field. [This is FieldFile for FileFields and
-        # ImageFieldFile for ImageFields; it's also conceivable that user
-        # subclasses might also want to subclass the attribute class]. This
-        # object understands how to convert a path to a file, and also how to
-        # handle None.
-        if isinstance(file, str) or file is None:
-            attr = self.field.attr_class(instance, self.field, file)
-            instance.__dict__[self.field.attname] = attr
-
-        # Other types of files may be assigned as well, but they need to have
-        # the FieldFile interface added to them. Thus, we wrap any other type of
-        # File inside a FieldFile (well, the field's attr_class, which is
-        # usually FieldFile).
-        elif isinstance(file, File) and not isinstance(file, FieldFile):
-            file_copy = self.field.attr_class(instance, self.field, file.name)
-            file_copy.file = file
-            file_copy._committed = False
-            instance.__dict__[self.field.attname] = file_copy
-
-        # Finally, because of the (some would say boneheaded) way pickle works,
-        # the underlying FieldFile might not actually itself have an associated
-        # file. So we need to reset the details of the FieldFile in those cases.
-        elif isinstance(file, FieldFile) and not hasattr(file, "field"):
-            file.instance = instance
-            file.field = self.field
-            file.storage = self.field.storage
-
-        # Make sure that the instance is correct.
-        elif isinstance(file, FieldFile) and instance is not file.instance:
-            file.instance = instance
-
-        # That was fun, wasn't it?
-        return instance.__dict__[self.field.attname]
-
-    def __set__(self, instance, value):
-        instance.__dict__[self.field.attname] = value
-
-
-class FileField(Field):
-    # The class to wrap instance attributes in. Accessing the file object off
-    # the instance will always return an instance of attr_class.
-    attr_class = FieldFile
-
-    # The descriptor to use for accessing the attribute off of the class.
-    descriptor_class = FileDescriptor
-
-    description = _("File")
-
-    def __init__(
-        self, verbose_name=None, name=None, upload_to="", storage=None, **kwargs
-    ):
-        self._primary_key_set_explicitly = "primary_key" in kwargs
-
-        self.storage = storage or default_storage
-        if callable(self.storage):
-            # Hold a reference to the callable for deconstruct().
-            self._storage_callable = self.storage
-            self.storage = self.storage()
-            if not isinstance(self.storage, Storage):
-                raise TypeError(
-                    "%s.storage must be a subclass/instance of %s.%s"
-                    % (
-                        self.__class__.__qualname__,
-                        Storage.__module__,
-                        Storage.__qualname__,
-                    )
-                )
-        self.upload_to = upload_to
-
-        kwargs.setdefault("max_length", 100)
-        super().__init__(verbose_name, name, **kwargs)
-
-    def check(self, **kwargs):
-        return [
-            *super().check(**kwargs),
-            *self._check_primary_key(),
-            *self._check_upload_to(),
-        ]
-
-    def _check_primary_key(self):
-        if self._primary_key_set_explicitly:
-            return [
-                checks.Error(
-                    "'primary_key' is not a valid argument for a %s."
-                    % self.__class__.__name__,
-                    obj=self,
-                    id="fields.E201",
-                )
-            ]
-        else:
-            return []
-
-    def _check_upload_to(self):
-        if isinstance(self.upload_to, str) and self.upload_to.startswith("/"):
-            return [
-                checks.Error(
-                    "%s's 'upload_to' argument must be a relative path, not an "
-                    "absolute path." % self.__class__.__name__,
-                    obj=self,
-                    id="fields.E202",
-                    hint="Remove the leading slash.",
-                )
-            ]
-        else:
-            return []
-
-    def deconstruct(self):
-        name, path, args, kwargs = super().deconstruct()
-        if kwargs.get("max_length") == 100:
-            del kwargs["max_length"]
-        kwargs["upload_to"] = self.upload_to
-        storage = getattr(self, "_storage_callable", self.storage)
-        if storage is not default_storage:
-            kwargs["storage"] = storage
-        return name, path, args, kwargs
-
-    def get_internal_type(self):
-        return "FileField"
-
-    def get_prep_value(self, value):
-        value = super().get_prep_value(value)
-        # Need to convert File objects provided via a form to string for
-        # database insertion.
-        if value is None:
-            return None
-        return str(value)
-
-    def pre_save(self, model_instance, add):
-        file = super().pre_save(model_instance, add)
-        if file and not file._committed:
-            # Commit the file to storage prior to saving the model
-            file.save(file.name, file.file, save=False)
-        return file
-
-    def contribute_to_class(self, cls, name, **kwargs):
-        super().contribute_to_class(cls, name, **kwargs)
-        setattr(cls, self.attname, self.descriptor_class(self))
-
-    def generate_filename(self, instance, filename):
-        """
-        Apply (if callable) or prepend (if a string) upload_to to the filename,
-        then delegate further processing of the name to the storage backend.
-        Until the storage layer, all file paths are expected to be Unix style
-        (with forward slashes).
-        """
-        if callable(self.upload_to):
-            filename = self.upload_to(instance, filename)
-        else:
-            dirname = datetime.datetime.now().strftime(str(self.upload_to))
-            filename = posixpath.join(dirname, filename)
-        filename = validate_file_name(filename, allow_relative_path=True)
-        return self.storage.generate_filename(filename)
-
-    def save_form_data(self, instance, data):
-        # Important: None means "no change", other false value means "clear"
-        # This subtle distinction (rather than a more explicit marker) is
-        # needed because we need to consume values that are also sane for a
-        # regular (non Model-) Form to find in its cleaned_data dictionary.
-        if data is not None:
-            # This value will be converted to str and stored in the
-            # database, so leaving False as-is is not acceptable.
-            setattr(instance, self.name, data or "")
-
-    def formfield(self, **kwargs):
-        return super().formfield(
-            **{
-                "form_class": forms.FileField,
-                "max_length": self.max_length,
-                **kwargs,
-            }
-        )
-
-
-class ImageFileDescriptor(FileDescriptor):
-    """
-    Just like the FileDescriptor, but for ImageFields. The only difference is
-    assigning the width/height to the width_field/height_field, if appropriate.
-    """
-
-    def __set__(self, instance, value):
-        previous_file = instance.__dict__.get(self.field.attname)
-        super().__set__(instance, value)
-
-        # To prevent recalculating image dimensions when we are instantiating
-        # an object from the database (bug #11084), only update dimensions if
-        # the field had a value before this assignment.  Since the default
-        # value for FileField subclasses is an instance of field.attr_class,
-        # previous_file will only be None when we are called from
-        # Model.__init__().  The ImageField.update_dimension_fields method
-        # hooked up to the post_init signal handles the Model.__init__() cases.
-        # Assignment happening outside of Model.__init__() will trigger the
-        # update right here.
-        if previous_file is not None:
-            self.field.update_dimension_fields(instance, force=True)
-
-
-class ImageFieldFile(ImageFile, FieldFile):
-    def delete(self, save=True):
-        # Clear the image dimensions cache
-        if hasattr(self, "_dimensions_cache"):
-            del self._dimensions_cache
-        super().delete(save)
-
-
-class ImageField(FileField):
-    attr_class = ImageFieldFile
-    descriptor_class = ImageFileDescriptor
-    description = _("Image")
-
-    def __init__(
-        self,
-        verbose_name=None,
-        name=None,
-        width_field=None,
-        height_field=None,
-        **kwargs,
-    ):
-        self.width_field, self.height_field = width_field, height_field
-        super().__init__(verbose_name, name, **kwargs)
-
-    def check(self, **kwargs):
-        return [
-            *super().check(**kwargs),
-            *self._check_image_library_installed(),
-        ]
-
-    def _check_image_library_installed(self):
-        try:
-            from PIL import Image  # NOQA
-        except ImportError:
-            return [
-                checks.Error(
-                    "Cannot use ImageField because Pillow is not installed.",
-                    hint=(
-                        "Get Pillow at https://pypi.org/project/Pillow/ "
-                        'or run command "python -m pip install Pillow".'
-                    ),
-                    obj=self,
-                    id="fields.E210",
-                )
-            ]
-        else:
-            return []
-
-    def deconstruct(self):
-        name, path, args, kwargs = super().deconstruct()
-        if self.width_field:
-            kwargs["width_field"] = self.width_field
-        if self.height_field:
-            kwargs["height_field"] = self.height_field
-        return name, path, args, kwargs
-
-    def contribute_to_class(self, cls, name, **kwargs):
-        super().contribute_to_class(cls, name, **kwargs)
-        # Attach update_dimension_fields so that dimension fields declared
-        # after their corresponding image field don't stay cleared by
-        # Model.__init__, see bug #11196.
-        # Only run post-initialization dimension update on non-abstract models
-        if not cls._meta.abstract:
-            signals.post_init.connect(self.update_dimension_fields, sender=cls)
-
-    def update_dimension_fields(self, instance, force=False, *args, **kwargs):
-        """
-        Update field's width and height fields, if defined.
-
-        This method is hooked up to model's post_init signal to update
-        dimensions after instantiating a model instance.  However, dimensions
-        won't be updated if the dimensions fields are already populated.  This
-        avoids unnecessary recalculation when loading an object from the
-        database.
-
-        Dimensions can be forced to update with force=True, which is how
-        ImageFileDescriptor.__set__ calls this method.
-        """
-        # Nothing to update if the field doesn't have dimension fields or if
-        # the field is deferred.
-        has_dimension_fields = self.width_field or self.height_field
-        if not has_dimension_fields or self.attname not in instance.__dict__:
-            return
-
-        # getattr will call the ImageFileDescriptor's __get__ method, which
-        # coerces the assigned value into an instance of self.attr_class
-        # (ImageFieldFile in this case).
-        file = getattr(instance, self.attname)
-
-        # Nothing to update if we have no file and not being forced to update.
-        if not file and not force:
-            return
-
-        dimension_fields_filled = not (
-            (self.width_field and not getattr(instance, self.width_field))
-            or (self.height_field and not getattr(instance, self.height_field))
-        )
-        # When both dimension fields have values, we are most likely loading
-        # data from the database or updating an image field that already had
-        # an image stored.  In the first case, we don't want to update the
-        # dimension fields because we are already getting their values from the
-        # database.  In the second case, we do want to update the dimensions
-        # fields and will skip this return because force will be True since we
-        # were called from ImageFileDescriptor.__set__.
-        if dimension_fields_filled and not force:
-            return
-
-        # file should be an instance of ImageFieldFile or should be None.
-        if file:
-            width = file.width
-            height = file.height
-        else:
-            # No file, so clear dimensions fields.
-            width = None
-            height = None
-
-        # Update the width and height fields.
-        if self.width_field:
-            setattr(instance, self.width_field, width)
-        if self.height_field:
-            setattr(instance, self.height_field, height)
-
-    def formfield(self, **kwargs):
-        return super().formfield(
-            **{
-                "form_class": forms.ImageField,
-                **kwargs,
-            }
-        )
+    def file_path(self, request, response=None, info=None, *, item=None):
+        media_guid = hashlib.sha1(to_bytes(request.url)).hexdigest()
+        media_ext = Path(request.url).suffix
+        # Handles empty and wild extensions by trying to guess the
+        # mime type then extension or default to empty string otherwise
+        if media_ext not in mimetypes.types_map:
+            media_ext = ""
+            media_type = mimetypes.guess_type(request.url)[0]
+            if media_type:
+                media_ext = mimetypes.guess_extension(media_type)
+        return f"full/{media_guid}{media_ext}"

@@ -1,50 +1,85 @@
-from io import BytesIO
-import os
+from sentry_sdk import Hub
+from sentry_sdk.integrations.boto3 import Boto3Integration
+from tests.integrations.boto3.aws_mock import MockResponse
+from tests.integrations.boto3 import read_fixture
 
-import pytest
+import boto3
 
-import pandas.util._test_decorators as td
-
-from pandas import read_csv
-import pandas._testing as tm
-
-
-def test_streaming_s3_objects():
-    # GH17135
-    # botocore gained iteration support in 1.10.47, can now be used in read_*
-    pytest.importorskip("botocore", minversion="1.10.47")
-    from botocore.response import StreamingBody
-
-    data = [b"foo,bar,baz\n1,2,3\n4,5,6\n", b"just,the,header\n"]
-    for el in data:
-        body = StreamingBody(BytesIO(el), content_length=len(el))
-        read_csv(body)
+session = boto3.Session(
+    aws_access_key_id="-",
+    aws_secret_access_key="-",
+)
 
 
-@td.skip_if_no("s3fs")
-@pytest.mark.network
-@tm.network
-def test_read_without_creds_from_pub_bucket():
-    # GH 34626
-    # Use Amazon Open Data Registry - https://registry.opendata.aws/gdelt
-    result = read_csv("s3://gdelt-open-data/events/1981.csv", nrows=3)
-    assert len(result) == 3
+def test_basic(sentry_init, capture_events):
+    sentry_init(traces_sample_rate=1.0, integrations=[Boto3Integration()])
+    events = capture_events()
+
+    s3 = session.resource("s3")
+    with Hub.current.start_transaction() as transaction, MockResponse(
+        s3.meta.client, 200, {}, read_fixture("s3_list.xml")
+    ):
+        bucket = s3.Bucket("bucket")
+        items = [obj for obj in bucket.objects.all()]
+        assert len(items) == 2
+        assert items[0].key == "foo.txt"
+        assert items[1].key == "bar.txt"
+        transaction.finish()
+
+    (event,) = events
+    assert event["type"] == "transaction"
+    assert len(event["spans"]) == 1
+    (span,) = event["spans"]
+    assert span["op"] == "http.client"
+    assert span["description"] == "aws.s3.ListObjects"
 
 
-@td.skip_if_no("s3fs")
-@pytest.mark.network
-@tm.network
-def test_read_with_creds_from_pub_bucket():
-    # Ensure we can read from a public bucket with credentials
-    # GH 34626
-    # Use Amazon Open Data Registry - https://registry.opendata.aws/gdelt
+def test_streaming(sentry_init, capture_events):
+    sentry_init(traces_sample_rate=1.0, integrations=[Boto3Integration()])
+    events = capture_events()
 
-    with tm.ensure_safe_environment_variables():
-        # temporary workaround as moto fails for botocore >= 1.11 otherwise,
-        # see https://github.com/spulec/moto/issues/1924 & 1952
-        os.environ.setdefault("AWS_ACCESS_KEY_ID", "foobar_key")
-        os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "foobar_secret")
-        df = read_csv(
-            "s3://gdelt-open-data/events/1981.csv", nrows=5, sep="\t", header=None
-        )
-        assert len(df) == 5
+    s3 = session.resource("s3")
+    with Hub.current.start_transaction() as transaction, MockResponse(
+        s3.meta.client, 200, {}, b"hello"
+    ):
+        obj = s3.Bucket("bucket").Object("foo.pdf")
+        body = obj.get()["Body"]
+        assert body.read(1) == b"h"
+        assert body.read(2) == b"el"
+        assert body.read(3) == b"lo"
+        assert body.read(1) == b""
+        transaction.finish()
+
+    (event,) = events
+    assert event["type"] == "transaction"
+    assert len(event["spans"]) == 2
+    span1 = event["spans"][0]
+    assert span1["op"] == "http.client"
+    assert span1["description"] == "aws.s3.GetObject"
+    span2 = event["spans"][1]
+    assert span2["op"] == "http.client.stream"
+    assert span2["description"] == "aws.s3.GetObject"
+    assert span2["parent_span_id"] == span1["span_id"]
+
+
+def test_streaming_close(sentry_init, capture_events):
+    sentry_init(traces_sample_rate=1.0, integrations=[Boto3Integration()])
+    events = capture_events()
+
+    s3 = session.resource("s3")
+    with Hub.current.start_transaction() as transaction, MockResponse(
+        s3.meta.client, 200, {}, b"hello"
+    ):
+        obj = s3.Bucket("bucket").Object("foo.pdf")
+        body = obj.get()["Body"]
+        assert body.read(1) == b"h"
+        body.close()  # close partially-read stream
+        transaction.finish()
+
+    (event,) = events
+    assert event["type"] == "transaction"
+    assert len(event["spans"]) == 2
+    span1 = event["spans"][0]
+    assert span1["op"] == "http.client"
+    span2 = event["spans"][1]
+    assert span2["op"] == "http.client.stream"

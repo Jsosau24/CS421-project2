@@ -1,139 +1,91 @@
-import os
-import select
-import sys
-import traceback
+"""
+Scrapy Shell
 
-from django.core.management import BaseCommand, CommandError
-from django.utils.datastructures import OrderedSet
+See documentation in docs/topics/shell.rst
+"""
+from threading import Thread
+
+from scrapy.commands import ScrapyCommand
+from scrapy.http import Request
+from scrapy.shell import Shell
+from scrapy.utils.spider import DefaultSpider, spidercls_for_request
+from scrapy.utils.url import guess_scheme
 
 
-class Command(BaseCommand):
-    help = (
-        "Runs a Python interactive interpreter. Tries to use IPython or "
-        "bpython, if one of them is available. Any standard input is executed "
-        "as code."
-    )
+class Command(ScrapyCommand):
+    requires_project = False
+    default_settings = {
+        "KEEP_ALIVE": True,
+        "LOGSTATS_INTERVAL": 0,
+        "DUPEFILTER_CLASS": "scrapy.dupefilters.BaseDupeFilter",
+    }
 
-    requires_system_checks = []
-    shells = ["ipython", "bpython", "python"]
+    def syntax(self):
+        return "[url|file]"
 
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--no-startup",
-            action="store_true",
-            help=(
-                "When using plain Python, ignore the PYTHONSTARTUP environment "
-                "variable and ~/.pythonrc.py script."
-            ),
+    def short_desc(self):
+        return "Interactive scraping console"
+
+    def long_desc(self):
+        return (
+            "Interactive console for scraping the given url or file. "
+            "Use ./file.html syntax or full path for local file."
         )
-        parser.add_argument(
-            "-i",
-            "--interface",
-            choices=self.shells,
-            help=(
-                "Specify an interactive interpreter interface. Available options: "
-                '"ipython", "bpython", and "python"'
-            ),
-        )
+
+    def add_options(self, parser):
+        ScrapyCommand.add_options(self, parser)
         parser.add_argument(
             "-c",
-            "--command",
-            help=(
-                "Instead of opening an interactive shell, run a command as Django and "
-                "exit."
-            ),
+            dest="code",
+            help="evaluate the code in the shell, print the result and exit",
+        )
+        parser.add_argument("--spider", dest="spider", help="use this spider")
+        parser.add_argument(
+            "--no-redirect",
+            dest="no_redirect",
+            action="store_true",
+            default=False,
+            help="do not handle HTTP 3xx status codes and print response as-is",
         )
 
-    def ipython(self, options):
-        from IPython import start_ipython
+    def update_vars(self, vars):
+        """You can use this function to update the Scrapy objects that will be
+        available in the shell
+        """
+        pass
 
-        start_ipython(argv=[])
+    def run(self, args, opts):
+        url = args[0] if args else None
+        if url:
+            # first argument may be a local file
+            url = guess_scheme(url)
 
-    def bpython(self, options):
-        import bpython
+        spider_loader = self.crawler_process.spider_loader
 
-        bpython.embed()
+        spidercls = DefaultSpider
+        if opts.spider:
+            spidercls = spider_loader.load(opts.spider)
+        elif url:
+            spidercls = spidercls_for_request(
+                spider_loader, Request(url), spidercls, log_multiple=True
+            )
 
-    def python(self, options):
-        import code
+        # The crawler is created this way since the Shell manually handles the
+        # crawling engine, so the set up in the crawl method won't work
+        crawler = self.crawler_process._create_crawler(spidercls)
+        # The Shell class needs a persistent engine in the crawler
+        crawler.engine = crawler._create_engine()
+        crawler.engine.start()
 
-        # Set up a dictionary to serve as the environment for the shell.
-        imported_objects = {}
+        self._start_crawler_thread()
 
-        # We want to honor both $PYTHONSTARTUP and .pythonrc.py, so follow system
-        # conventions and get $PYTHONSTARTUP first then .pythonrc.py.
-        if not options["no_startup"]:
-            for pythonrc in OrderedSet(
-                [os.environ.get("PYTHONSTARTUP"), os.path.expanduser("~/.pythonrc.py")]
-            ):
-                if not pythonrc:
-                    continue
-                if not os.path.isfile(pythonrc):
-                    continue
-                with open(pythonrc) as handle:
-                    pythonrc_code = handle.read()
-                # Match the behavior of the cpython shell where an error in
-                # PYTHONSTARTUP prints an exception and continues.
-                try:
-                    exec(compile(pythonrc_code, pythonrc, "exec"), imported_objects)
-                except Exception:
-                    traceback.print_exc()
+        shell = Shell(crawler, update_vars=self.update_vars, code=opts.code)
+        shell.start(url=url, redirect=not opts.no_redirect)
 
-        # By default, this will set up readline to do tab completion and to read and
-        # write history to the .python_history file, but this can be overridden by
-        # $PYTHONSTARTUP or ~/.pythonrc.py.
-        try:
-            hook = sys.__interactivehook__
-        except AttributeError:
-            # Match the behavior of the cpython shell where a missing
-            # sys.__interactivehook__ is ignored.
-            pass
-        else:
-            try:
-                hook()
-            except Exception:
-                # Match the behavior of the cpython shell where an error in
-                # sys.__interactivehook__ prints a warning and the exception
-                # and continues.
-                print("Failed calling sys.__interactivehook__")
-                traceback.print_exc()
-
-        # Set up tab completion for objects imported by $PYTHONSTARTUP or
-        # ~/.pythonrc.py.
-        try:
-            import readline
-            import rlcompleter
-
-            readline.set_completer(rlcompleter.Completer(imported_objects).complete)
-        except ImportError:
-            pass
-
-        # Start the interactive interpreter.
-        code.interact(local=imported_objects)
-
-    def handle(self, **options):
-        # Execute the command and exit.
-        if options["command"]:
-            exec(options["command"], globals())
-            return
-
-        # Execute stdin if it has anything to read and exit.
-        # Not supported on Windows due to select.select() limitations.
-        if (
-            sys.platform != "win32"
-            and not sys.stdin.isatty()
-            and select.select([sys.stdin], [], [], 0)[0]
-        ):
-            exec(sys.stdin.read(), globals())
-            return
-
-        available_shells = (
-            [options["interface"]] if options["interface"] else self.shells
+    def _start_crawler_thread(self):
+        t = Thread(
+            target=self.crawler_process.start,
+            kwargs={"stop_after_crawl": False, "install_signal_handlers": False},
         )
-
-        for shell in available_shells:
-            try:
-                return getattr(self, shell)(options)
-            except ImportError:
-                pass
-        raise CommandError("Couldn't import {} interface.".format(shell))
+        t.daemon = True
+        t.start()

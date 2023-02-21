@@ -1,14 +1,22 @@
-from django.test import SimpleTestCase
-from django.utils.connection import BaseConnectionHandler
+# -*- coding: utf-8 -*-
+# Copyright: (c) 2021, Matt Martz <matt@sivel.net>
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+from ansible.module_utils import connection
+
+import pytest
 
 
-class BaseConnectionHandlerTests(SimpleTestCase):
-    def test_create_connection(self):
-        handler = BaseConnectionHandler()
-        msg = "Subclasses must implement create_connection()."
-        with self.assertRaisesMessage(NotImplementedError, msg):
-            handler.create_connection(None)
+def test_set_options_credential_exposure():
+    def send(data):
+        return '{'
 
-    def test_all_initialized_only(self):
-        handler = BaseConnectionHandler({"default": {}})
-        self.assertEqual(handler.all(initialized_only=True), [])
+    c = connection.Connection(connection.__file__)
+    c.send = send
+    with pytest.raises(connection.ConnectionError) as excinfo:
+        c._exec_jsonrpc('set_options', become_pass='password')
+
+    assert 'password' not in str(excinfo.value)

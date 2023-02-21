@@ -1,55 +1,62 @@
-from django.conf import DEFAULT_STORAGE_ALIAS, STATICFILES_STORAGE_ALIAS, settings
-from django.core.exceptions import ImproperlyConfigured
-from django.utils.functional import cached_property
-from django.utils.module_loading import import_string
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+from ansible.playbook.attribute import FieldAttribute
+from ansible.playbook.task import Task
+from ansible.module_utils.six import string_types
 
 
-class InvalidStorageError(ImproperlyConfigured):
-    pass
+class Handler(Task):
 
+    listen = FieldAttribute(isa='list', default=list, listof=string_types, static=True)
 
-class StorageHandler:
-    def __init__(self, backends=None):
-        # backends is an optional dict of storage backend definitions
-        # (structured like settings.STORAGES).
-        self._backends = backends
-        self._storages = {}
+    def __init__(self, block=None, role=None, task_include=None):
+        self.notified_hosts = []
 
-    @cached_property
-    def backends(self):
-        if self._backends is None:
-            self._backends = settings.STORAGES.copy()
-            # RemovedInDjango51Warning.
-            if settings.is_overridden("DEFAULT_FILE_STORAGE"):
-                self._backends[DEFAULT_STORAGE_ALIAS] = {
-                    "BACKEND": settings.DEFAULT_FILE_STORAGE
-                }
-            if settings.is_overridden("STATICFILES_STORAGE"):
-                self._backends[STATICFILES_STORAGE_ALIAS] = {
-                    "BACKEND": settings.STATICFILES_STORAGE
-                }
-        return self._backends
+        self.cached_name = False
 
-    def __getitem__(self, alias):
-        try:
-            return self._storages[alias]
-        except KeyError:
-            try:
-                params = self.backends[alias]
-            except KeyError:
-                raise InvalidStorageError(
-                    f"Could not find config for '{alias}' in settings.STORAGES."
-                )
-            storage = self.create_storage(params)
-            self._storages[alias] = storage
-            return storage
+        super(Handler, self).__init__(block=block, role=role, task_include=task_include)
 
-    def create_storage(self, params):
-        params = params.copy()
-        backend = params.pop("BACKEND")
-        options = params.pop("OPTIONS", {})
-        try:
-            storage_cls = import_string(backend)
-        except ImportError as e:
-            raise InvalidStorageError(f"Could not find backend {backend!r}: {e}") from e
-        return storage_cls(**options)
+    def __repr__(self):
+        ''' returns a human readable representation of the handler '''
+        return "HANDLER: %s" % self.get_name()
+
+    @staticmethod
+    def load(data, block=None, role=None, task_include=None, variable_manager=None, loader=None):
+        t = Handler(block=block, role=role, task_include=task_include)
+        return t.load_data(data, variable_manager=variable_manager, loader=loader)
+
+    def notify_host(self, host):
+        if not self.is_host_notified(host):
+            self.notified_hosts.append(host)
+            return True
+        return False
+
+    def remove_host(self, host):
+        self.notified_hosts = [h for h in self.notified_hosts if h != host]
+
+    def is_host_notified(self, host):
+        return host in self.notified_hosts
+
+    def serialize(self):
+        result = super(Handler, self).serialize()
+        result['is_handler'] = True
+        return result

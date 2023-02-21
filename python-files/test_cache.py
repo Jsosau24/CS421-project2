@@ -1,218 +1,200 @@
-from django.core.cache import cache
-from django.template import Context, Engine, TemplateSyntaxError
-from django.test import SimpleTestCase, override_settings
+# (c) 2012-2015, Michael DeHaan <michael.dehaan@gmail.com>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-from ..utils import setup
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+import os
+import shutil
+import tempfile
+
+from unittest import mock
+
+from units.compat import unittest
+from ansible.errors import AnsibleError
+from ansible.plugins.cache import CachePluginAdjudicator
+from ansible.plugins.cache.memory import CacheModule as MemoryCache
+from ansible.plugins.loader import cache_loader, init_plugin_loader
+from ansible.vars.fact_cache import FactCache
+
+import pytest
 
 
-class CacheTagTests(SimpleTestCase):
-    libraries = {
-        "cache": "django.templatetags.cache",
-        "custom": "template_tests.templatetags.custom",
-    }
+class TestCachePluginAdjudicator(unittest.TestCase):
+    def setUp(self):
+        # memory plugin cache
+        self.cache = CachePluginAdjudicator()
+        self.cache['cache_key'] = {'key1': 'value1', 'key2': 'value2'}
+        self.cache['cache_key_2'] = {'key': 'value'}
+
+    def test___setitem__(self):
+        self.cache['new_cache_key'] = {'new_key1': ['new_value1', 'new_value2']}
+        assert self.cache['new_cache_key'] == {'new_key1': ['new_value1', 'new_value2']}
+
+    def test_inner___setitem__(self):
+        self.cache['new_cache_key'] = {'new_key1': ['new_value1', 'new_value2']}
+        self.cache['new_cache_key']['new_key1'][0] = 'updated_value1'
+        assert self.cache['new_cache_key'] == {'new_key1': ['updated_value1', 'new_value2']}
+
+    def test___contains__(self):
+        assert 'cache_key' in self.cache
+        assert 'not_cache_key' not in self.cache
+
+    def test_get(self):
+        assert self.cache.get('cache_key') == {'key1': 'value1', 'key2': 'value2'}
+
+    def test_get_with_default(self):
+        assert self.cache.get('foo', 'bar') == 'bar'
+
+    def test_get_without_default(self):
+        assert self.cache.get('foo') is None
+
+    def test___getitem__(self):
+        with pytest.raises(KeyError):
+            self.cache['foo']  # pylint: disable=pointless-statement
+
+    def test_pop_with_default(self):
+        assert self.cache.pop('foo', 'bar') == 'bar'
+
+    def test_pop_without_default(self):
+        with pytest.raises(KeyError):
+            assert self.cache.pop('foo')
+
+    def test_pop(self):
+        v = self.cache.pop('cache_key_2')
+        assert v == {'key': 'value'}
+        assert 'cache_key_2' not in self.cache
+
+    def test_update(self):
+        self.cache.update({'cache_key': {'key2': 'updatedvalue'}})
+        assert self.cache['cache_key']['key2'] == 'updatedvalue'
+
+    def test_update_cache_if_changed(self):
+        # Changes are stored in the CachePluginAdjudicator and will be
+        # persisted to the plugin when calling update_cache_if_changed()
+        # The exception is flush which flushes the plugin immediately.
+        assert len(self.cache.keys()) == 2
+        assert len(self.cache._plugin.keys()) == 0
+        self.cache.update_cache_if_changed()
+        assert len(self.cache._plugin.keys()) == 2
+
+    def test_flush(self):
+        # Fake that the cache already has some data in it but the adjudicator
+        # hasn't loaded it in.
+        self.cache._plugin.set('monkey', 'animal')
+        self.cache._plugin.set('wolf', 'animal')
+        self.cache._plugin.set('another wolf', 'another animal')
+
+        # The adjudicator does't know about the new entries
+        assert len(self.cache.keys()) == 2
+        # But the cache itself does
+        assert len(self.cache._plugin.keys()) == 3
+
+        # If we call flush, both the adjudicator and the cache should flush
+        self.cache.flush()
+        assert len(self.cache.keys()) == 0
+        assert len(self.cache._plugin.keys()) == 0
+
+
+class TestJsonFileCache(TestCachePluginAdjudicator):
+    cache_prefix = ''
+
+    def setUp(self):
+        self.cache_dir = tempfile.mkdtemp(prefix='ansible-plugins-cache-')
+        self.cache = CachePluginAdjudicator(
+            plugin_name='jsonfile', _uri=self.cache_dir,
+            _prefix=self.cache_prefix)
+        self.cache['cache_key'] = {'key1': 'value1', 'key2': 'value2'}
+        self.cache['cache_key_2'] = {'key': 'value'}
+
+    def test_keys(self):
+        # A cache without a prefix will consider all files in the cache
+        # directory as valid cache entries.
+        self.cache._plugin._dump(
+            'no prefix', os.path.join(self.cache_dir, 'no_prefix'))
+        self.cache._plugin._dump(
+            'special cache', os.path.join(self.cache_dir, 'special_test'))
+
+        # The plugin does not know the CachePluginAdjudicator entries.
+        assert sorted(self.cache._plugin.keys()) == [
+            'no_prefix', 'special_test']
+
+        assert 'no_prefix' in self.cache
+        assert 'special_test' in self.cache
+        assert 'test' not in self.cache
+        assert self.cache['no_prefix'] == 'no prefix'
+        assert self.cache['special_test'] == 'special cache'
 
     def tearDown(self):
-        cache.clear()
-
-    @setup({"cache03": "{% load cache %}{% cache 2 test %}cache03{% endcache %}"})
-    def test_cache03(self):
-        output = self.engine.render_to_string("cache03")
-        self.assertEqual(output, "cache03")
-
-    @setup(
-        {
-            "cache03": "{% load cache %}{% cache 2 test %}cache03{% endcache %}",
-            "cache04": "{% load cache %}{% cache 2 test %}cache04{% endcache %}",
-        }
-    )
-    def test_cache04(self):
-        self.engine.render_to_string("cache03")
-        output = self.engine.render_to_string("cache04")
-        self.assertEqual(output, "cache03")
-
-    @setup({"cache05": "{% load cache %}{% cache 2 test foo %}cache05{% endcache %}"})
-    def test_cache05(self):
-        output = self.engine.render_to_string("cache05", {"foo": 1})
-        self.assertEqual(output, "cache05")
-
-    @setup({"cache06": "{% load cache %}{% cache 2 test foo %}cache06{% endcache %}"})
-    def test_cache06(self):
-        output = self.engine.render_to_string("cache06", {"foo": 2})
-        self.assertEqual(output, "cache06")
-
-    @setup(
-        {
-            "cache05": "{% load cache %}{% cache 2 test foo %}cache05{% endcache %}",
-            "cache07": "{% load cache %}{% cache 2 test foo %}cache07{% endcache %}",
-        }
-    )
-    def test_cache07(self):
-        context = {"foo": 1}
-        self.engine.render_to_string("cache05", context)
-        output = self.engine.render_to_string("cache07", context)
-        self.assertEqual(output, "cache05")
-
-    @setup(
-        {
-            "cache06": "{% load cache %}{% cache 2 test foo %}cache06{% endcache %}",
-            "cache08": "{% load cache %}{% cache time test foo %}cache08{% endcache %}",
-        }
-    )
-    def test_cache08(self):
-        """
-        Allow first argument to be a variable.
-        """
-        context = {"foo": 2, "time": 2}
-        self.engine.render_to_string("cache06", context)
-        output = self.engine.render_to_string("cache08", context)
-        self.assertEqual(output, "cache06")
-
-    # Raise exception if we don't have at least 2 args, first one integer.
-    @setup({"cache11": "{% load cache %}{% cache %}{% endcache %}"})
-    def test_cache11(self):
-        with self.assertRaises(TemplateSyntaxError):
-            self.engine.get_template("cache11")
-
-    @setup({"cache12": "{% load cache %}{% cache 1 %}{% endcache %}"})
-    def test_cache12(self):
-        with self.assertRaises(TemplateSyntaxError):
-            self.engine.get_template("cache12")
-
-    @setup({"cache13": "{% load cache %}{% cache foo bar %}{% endcache %}"})
-    def test_cache13(self):
-        with self.assertRaises(TemplateSyntaxError):
-            self.engine.render_to_string("cache13")
-
-    @setup({"cache14": "{% load cache %}{% cache foo bar %}{% endcache %}"})
-    def test_cache14(self):
-        with self.assertRaises(TemplateSyntaxError):
-            self.engine.render_to_string("cache14", {"foo": "fail"})
-
-    @setup({"cache15": "{% load cache %}{% cache foo bar %}{% endcache %}"})
-    def test_cache15(self):
-        with self.assertRaises(TemplateSyntaxError):
-            self.engine.render_to_string("cache15", {"foo": []})
-
-    @setup({"cache16": "{% load cache %}{% cache 1 foo bar %}{% endcache %}"})
-    def test_cache16(self):
-        """
-        Regression test for #7460.
-        """
-        output = self.engine.render_to_string(
-            "cache16", {"foo": "foo", "bar": "with spaces"}
-        )
-        self.assertEqual(output, "")
-
-    @setup(
-        {
-            "cache17": (
-                "{% load cache %}{% cache 10 long_cache_key poem %}Some Content"
-                "{% endcache %}"
-            )
-        }
-    )
-    def test_cache17(self):
-        """
-        Regression test for #11270.
-        """
-        output = self.engine.render_to_string(
-            "cache17",
-            {
-                "poem": (
-                    "Oh freddled gruntbuggly/Thy micturations are to me/"
-                    "As plurdled gabbleblotchits/On a lurgid bee/"
-                    "That mordiously hath bitled out/Its earted jurtles/"
-                    "Into a rancid festering/Or else I shall rend thee in the "
-                    "gobberwarts with my blurglecruncheon/See if I don't."
-                ),
-            },
-        )
-        self.assertEqual(output, "Some Content")
-
-    @setup(
-        {
-            "cache18": (
-                '{% load cache custom %}{% cache 2|noop:"x y" cache18 %}cache18'
-                "{% endcache %}"
-            )
-        }
-    )
-    def test_cache18(self):
-        """
-        Test whitespace in filter arguments
-        """
-        output = self.engine.render_to_string("cache18")
-        self.assertEqual(output, "cache18")
-
-    @setup(
-        {
-            "first": "{% load cache %}{% cache None fragment19 %}content{% endcache %}",
-            "second": (
-                "{% load cache %}{% cache None fragment19 %}not rendered{% endcache %}"
-            ),
-        }
-    )
-    def test_none_timeout(self):
-        """A timeout of None means "cache forever"."""
-        output = self.engine.render_to_string("first")
-        self.assertEqual(output, "content")
-        output = self.engine.render_to_string("second")
-        self.assertEqual(output, "content")
+        shutil.rmtree(self.cache_dir)
 
 
-class CacheTests(SimpleTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.engine = Engine(libraries={"cache": "django.templatetags.cache"})
-        super().setUpClass()
+class TestJsonFileCachePrefix(TestJsonFileCache):
+    cache_prefix = 'special_'
 
-    def test_cache_regression_20130(self):
-        t = self.engine.from_string(
-            "{% load cache %}{% cache 1 regression_20130 %}foo{% endcache %}"
-        )
-        cachenode = t.nodelist[1]
-        self.assertEqual(cachenode.fragment_name, "regression_20130")
+    def test_keys(self):
+        # For caches with a prefix only files that match the prefix are
+        # considered. The prefix is removed from the key name.
+        self.cache._plugin._dump(
+            'no prefix', os.path.join(self.cache_dir, 'no_prefix'))
+        self.cache._plugin._dump(
+            'special cache', os.path.join(self.cache_dir, 'special_test'))
 
-    @override_settings(
-        CACHES={
-            "default": {
-                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-                "LOCATION": "default",
-            },
-            "template_fragments": {
-                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-                "LOCATION": "fragments",
-            },
-        }
-    )
-    def test_cache_fragment_cache(self):
-        """
-        When a cache called "template_fragments" is present, the cache tag
-        will use it in preference to 'default'
-        """
-        t1 = self.engine.from_string(
-            "{% load cache %}{% cache 1 fragment %}foo{% endcache %}"
-        )
-        t2 = self.engine.from_string(
-            '{% load cache %}{% cache 1 fragment using="default" %}bar{% endcache %}'
-        )
+        # The plugin does not know the CachePluginAdjudicator entries.
+        assert sorted(self.cache._plugin.keys()) == ['test']
 
-        ctx = Context()
-        o1 = t1.render(ctx)
-        o2 = t2.render(ctx)
+        assert 'no_prefix' not in self.cache
+        assert 'special_test' not in self.cache
+        assert 'test' in self.cache
+        assert self.cache['test'] == 'special cache'
 
-        self.assertEqual(o1, "foo")
-        self.assertEqual(o2, "bar")
 
-    def test_cache_missing_backend(self):
-        """
-        When a cache that doesn't exist is specified, the cache tag will
-        raise a TemplateSyntaxError
-        '"""
-        t = self.engine.from_string(
-            '{% load cache %}{% cache 1 backend using="unknown" %}bar{% endcache %}'
-        )
+class TestFactCache(unittest.TestCase):
+    def setUp(self):
+        with mock.patch('ansible.constants.CACHE_PLUGIN', 'memory'):
+            self.cache = FactCache()
 
-        ctx = Context()
-        with self.assertRaises(TemplateSyntaxError):
-            t.render(ctx)
+    def test_copy(self):
+        self.cache['avocado'] = 'fruit'
+        self.cache['daisy'] = 'flower'
+        a_copy = self.cache.copy()
+        self.assertEqual(type(a_copy), dict)
+        self.assertEqual(a_copy, dict(avocado='fruit', daisy='flower'))
+
+    def test_flush(self):
+        self.cache['motorcycle'] = 'vehicle'
+        self.cache['sock'] = 'clothing'
+        self.cache.flush()
+        assert len(self.cache.keys()) == 0
+
+    def test_plugin_load_failure(self):
+        init_plugin_loader()
+        # See https://github.com/ansible/ansible/issues/18751
+        # Note no fact_connection config set, so this will fail
+        with mock.patch('ansible.constants.CACHE_PLUGIN', 'json'):
+            self.assertRaisesRegex(AnsibleError,
+                                   "Unable to load the facts cache plugin.*json.*",
+                                   FactCache)
+
+    def test_update(self):
+        self.cache.update({'cache_key': {'key2': 'updatedvalue'}})
+        assert self.cache['cache_key']['key2'] == 'updatedvalue'
+
+
+def test_memory_cachemodule_with_loader():
+    assert isinstance(cache_loader.get('memory'), MemoryCache)

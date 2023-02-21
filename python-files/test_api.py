@@ -1,100 +1,121 @@
-import re
+# -*- coding: utf-8 -*-
+# Copyright: (c) 2020, Abhijeet Kasurde <akasurde@redhat.com>
+# Copyright: (c) 2020, Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-import numpy as np
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+
+from ansible.module_utils.api import rate_limit, retry, retry_with_delays_and_condition
+
 import pytest
 
-from matplotlib import _api
+
+class CustomException(Exception):
+    pass
 
 
-@pytest.mark.parametrize('target,test_shape',
-                         [((None, ), (1, 3)),
-                          ((None, 3), (1,)),
-                          ((None, 3), (1, 2)),
-                          ((1, 5), (1, 9)),
-                          ((None, 2, None), (1, 3, 1))
-                          ])
-def test_check_shape(target, test_shape):
-    error_pattern = (f"^'aardvark' must be {len(target)}D.*" +
-                     re.escape(f'has shape {test_shape}'))
-    data = np.zeros(test_shape)
-    with pytest.raises(ValueError, match=error_pattern):
-        _api.check_shape(target, aardvark=data)
+class CustomBaseException(BaseException):
+    pass
 
 
-def test_classproperty_deprecation():
-    class A:
-        @_api.deprecated("0.0.0")
-        @_api.classproperty
-        def f(cls):
-            pass
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        A.f
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        a = A()
-        a.f
+class TestRateLimit:
+
+    def test_ratelimit(self):
+        @rate_limit(rate=1, rate_limit=1)
+        def login_database():
+            return "success"
+        r = login_database()
+
+        assert r == 'success'
 
 
-def test_deprecate_privatize_attribute():
-    class C:
-        def __init__(self): self._attr = 1
-        def _meth(self, arg): return arg
-        attr = _api.deprecate_privatize_attribute("0.0")
-        meth = _api.deprecate_privatize_attribute("0.0")
+class TestRetry:
 
-    c = C()
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        assert c.attr == 1
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        c.attr = 2
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        assert c.attr == 2
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        assert c.meth(42) == 42
+    def test_no_retry_required(self):
+        @retry(retries=4, retry_pause=2)
+        def login_database():
+            login_database.counter += 1
+            return 'success'
 
+        login_database.counter = 0
+        r = login_database()
 
-def test_delete_parameter():
-    @_api.delete_parameter("3.0", "foo")
-    def func1(foo=None):
-        pass
+        assert r == 'success'
+        assert login_database.counter == 1
 
-    @_api.delete_parameter("3.0", "foo")
-    def func2(**kwargs):
-        pass
+    def test_catch_exception(self):
 
-    for func in [func1, func2]:
-        func()  # No warning.
-        with pytest.warns(_api.MatplotlibDeprecationWarning):
-            func(foo="bar")
+        @retry(retries=1)
+        def login_database():
+            return 'success'
 
-    def pyplot_wrapper(foo=_api.deprecation._deprecated_parameter):
-        func1(foo)
+        with pytest.raises(Exception, match="Retry"):
+            login_database()
 
-    pyplot_wrapper()  # No warning.
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        func(foo="bar")
+    def test_no_retries(self):
+
+        @retry()
+        def login_database():
+            assert False, "Should not execute"
+
+        login_database()
 
 
-def test_make_keyword_only():
-    @_api.make_keyword_only("3.0", "arg")
-    def func(pre, arg, post=None):
-        pass
+class TestRetryWithDelaysAndCondition:
 
-    func(1, arg=2)  # Check that no warning is emitted.
+    def test_empty_retry_iterator(self):
+        @retry_with_delays_and_condition(backoff_iterator=[])
+        def login_database():
+            login_database.counter += 1
 
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        func(1, 2)
-    with pytest.warns(_api.MatplotlibDeprecationWarning):
-        func(1, 2, 3)
+        login_database.counter = 0
+        r = login_database()
+        assert login_database.counter == 1
 
+    def test_no_retry_exception(self):
+        @retry_with_delays_and_condition(
+            backoff_iterator=[1],
+            should_retry_error=lambda x: False,
+        )
+        def login_database():
+            login_database.counter += 1
+            if login_database.counter == 1:
+                raise CustomException("Error")
 
-def test_deprecation_alternative():
-    alternative = "`.f1`, `f2`, `f3(x) <.f3>` or `f4(x)<f4>`"
-    @_api.deprecated("1", alternative=alternative)
-    def f():
-        pass
-    assert alternative in f.__doc__
+        login_database.counter = 0
+        with pytest.raises(CustomException, match="Error"):
+            login_database()
+        assert login_database.counter == 1
 
+    def test_no_retry_baseexception(self):
+        @retry_with_delays_and_condition(
+            backoff_iterator=[1],
+            should_retry_error=lambda x: True,  # Retry all exceptions inheriting from Exception
+        )
+        def login_database():
+            login_database.counter += 1
+            if login_database.counter == 1:
+                # Raise an exception inheriting from BaseException
+                raise CustomBaseException("Error")
 
-def test_empty_check_in_list():
-    with pytest.raises(TypeError, match="No argument to check!"):
-        _api.check_in_list(["a"])
+        login_database.counter = 0
+        with pytest.raises(CustomBaseException, match="Error"):
+            login_database()
+        assert login_database.counter == 1
+
+    def test_retry_exception(self):
+        @retry_with_delays_and_condition(
+            backoff_iterator=[1],
+            should_retry_error=lambda x: isinstance(x, CustomException),
+        )
+        def login_database():
+            login_database.counter += 1
+            if login_database.counter == 1:
+                raise CustomException("Retry")
+            return 'success'
+
+        login_database.counter = 0
+        assert login_database() == 'success'
+        assert login_database.counter == 2

@@ -1,233 +1,172 @@
-"""Redis cache backend."""
+from __future__ import absolute_import
 
-import pickle
-import random
-import re
+from sentry_sdk import Hub
+from sentry_sdk.consts import OP
+from sentry_sdk.utils import capture_internal_exceptions, logger
+from sentry_sdk.integrations import Integration, DidNotEnable
 
-from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
-from django.utils.functional import cached_property
-from django.utils.module_loading import import_string
+from sentry_sdk._types import MYPY
+
+if MYPY:
+    from typing import Any, Sequence
+
+_SINGLE_KEY_COMMANDS = frozenset(
+    ["decr", "decrby", "get", "incr", "incrby", "pttl", "set", "setex", "setnx", "ttl"]
+)
+_MULTI_KEY_COMMANDS = frozenset(["del", "touch", "unlink"])
+
+#: Trim argument lists to this many values
+_MAX_NUM_ARGS = 10
 
 
-class RedisSerializer:
-    def __init__(self, protocol=None):
-        self.protocol = pickle.HIGHEST_PROTOCOL if protocol is None else protocol
+def patch_redis_pipeline(pipeline_cls, is_cluster, get_command_args_fn):
+    # type: (Any, bool, Any) -> None
+    old_execute = pipeline_cls.execute
 
-    def dumps(self, obj):
-        # Only skip pickling for integers, a int subclasses as bool should be
-        # pickled.
-        if type(obj) is int:
-            return obj
-        return pickle.dumps(obj, self.protocol)
+    def sentry_patched_execute(self, *args, **kwargs):
+        # type: (Any, *Any, **Any) -> Any
+        hub = Hub.current
 
-    def loads(self, data):
+        if hub.get_integration(RedisIntegration) is None:
+            return old_execute(self, *args, **kwargs)
+
+        with hub.start_span(
+            op=OP.DB_REDIS, description="redis.pipeline.execute"
+        ) as span:
+            with capture_internal_exceptions():
+                span.set_tag("redis.is_cluster", is_cluster)
+                transaction = self.transaction if not is_cluster else False
+                span.set_tag("redis.transaction", transaction)
+
+                commands = []
+                for i, arg in enumerate(self.command_stack):
+                    if i > _MAX_NUM_ARGS:
+                        break
+                    command_args = []
+                    for j, command_arg in enumerate(get_command_args_fn(arg)):
+                        if j > 0:
+                            command_arg = repr(command_arg)
+                        command_args.append(command_arg)
+                    commands.append(" ".join(command_args))
+
+                span.set_data(
+                    "redis.commands",
+                    {"count": len(self.command_stack), "first_ten": commands},
+                )
+
+            return old_execute(self, *args, **kwargs)
+
+    pipeline_cls.execute = sentry_patched_execute
+
+
+def _get_redis_command_args(command):
+    # type: (Any) -> Sequence[Any]
+    return command[0]
+
+
+def _parse_rediscluster_command(command):
+    # type: (Any) -> Sequence[Any]
+    return command.args
+
+
+def _patch_rediscluster():
+    # type: () -> None
+    try:
+        import rediscluster  # type: ignore
+    except ImportError:
+        return
+
+    patch_redis_client(rediscluster.RedisCluster, is_cluster=True)
+
+    # up to v1.3.6, __version__ attribute is a tuple
+    # from v2.0.0, __version__ is a string and VERSION a tuple
+    version = getattr(rediscluster, "VERSION", rediscluster.__version__)
+
+    # StrictRedisCluster was introduced in v0.2.0 and removed in v2.0.0
+    # https://github.com/Grokzen/redis-py-cluster/blob/master/docs/release-notes.rst
+    if (0, 2, 0) < version < (2, 0, 0):
+        pipeline_cls = rediscluster.pipeline.StrictClusterPipeline
+        patch_redis_client(rediscluster.StrictRedisCluster, is_cluster=True)
+    else:
+        pipeline_cls = rediscluster.pipeline.ClusterPipeline
+
+    patch_redis_pipeline(pipeline_cls, True, _parse_rediscluster_command)
+
+
+class RedisIntegration(Integration):
+    identifier = "redis"
+
+    @staticmethod
+    def setup_once():
+        # type: () -> None
         try:
-            return int(data)
-        except ValueError:
-            return pickle.loads(data)
+            import redis
+        except ImportError:
+            raise DidNotEnable("Redis client not installed")
 
-
-class RedisCacheClient:
-    def __init__(
-        self,
-        servers,
-        serializer=None,
-        pool_class=None,
-        parser_class=None,
-        **options,
-    ):
-        import redis
-
-        self._lib = redis
-        self._servers = servers
-        self._pools = {}
-
-        self._client = self._lib.Redis
-
-        if isinstance(pool_class, str):
-            pool_class = import_string(pool_class)
-        self._pool_class = pool_class or self._lib.ConnectionPool
-
-        if isinstance(serializer, str):
-            serializer = import_string(serializer)
-        if callable(serializer):
-            serializer = serializer()
-        self._serializer = serializer or RedisSerializer()
-
-        if isinstance(parser_class, str):
-            parser_class = import_string(parser_class)
-        parser_class = parser_class or self._lib.connection.DefaultParser
-
-        self._pool_options = {"parser_class": parser_class, **options}
-
-    def _get_connection_pool_index(self, write):
-        # Write to the first server. Read from other servers if there are more,
-        # otherwise read from the first server.
-        if write or len(self._servers) == 1:
-            return 0
-        return random.randint(1, len(self._servers) - 1)
-
-    def _get_connection_pool(self, write):
-        index = self._get_connection_pool_index(write)
-        if index not in self._pools:
-            self._pools[index] = self._pool_class.from_url(
-                self._servers[index],
-                **self._pool_options,
-            )
-        return self._pools[index]
-
-    def get_client(self, key=None, *, write=False):
-        # key is used so that the method signature remains the same and custom
-        # cache client can be implemented which might require the key to select
-        # the server, e.g. sharding.
-        pool = self._get_connection_pool(write)
-        return self._client(connection_pool=pool)
-
-    def add(self, key, value, timeout):
-        client = self.get_client(key, write=True)
-        value = self._serializer.dumps(value)
-
-        if timeout == 0:
-            if ret := bool(client.set(key, value, nx=True)):
-                client.delete(key)
-            return ret
+        patch_redis_client(redis.StrictRedis, is_cluster=False)
+        patch_redis_pipeline(redis.client.Pipeline, False, _get_redis_command_args)
+        try:
+            strict_pipeline = redis.client.StrictPipeline  # type: ignore
+        except AttributeError:
+            pass
         else:
-            return bool(client.set(key, value, ex=timeout, nx=True))
+            patch_redis_pipeline(strict_pipeline, False, _get_redis_command_args)
 
-    def get(self, key, default):
-        client = self.get_client(key)
-        value = client.get(key)
-        return default if value is None else self._serializer.loads(value)
-
-    def set(self, key, value, timeout):
-        client = self.get_client(key, write=True)
-        value = self._serializer.dumps(value)
-        if timeout == 0:
-            client.delete(key)
+        try:
+            import rb.clients  # type: ignore
+        except ImportError:
+            pass
         else:
-            client.set(key, value, ex=timeout)
+            patch_redis_client(rb.clients.FanoutClient, is_cluster=False)
+            patch_redis_client(rb.clients.MappingClient, is_cluster=False)
+            patch_redis_client(rb.clients.RoutingClient, is_cluster=False)
 
-    def touch(self, key, timeout):
-        client = self.get_client(key, write=True)
-        if timeout is None:
-            return bool(client.persist(key))
-        else:
-            return bool(client.expire(key, timeout))
-
-    def delete(self, key):
-        client = self.get_client(key, write=True)
-        return bool(client.delete(key))
-
-    def get_many(self, keys):
-        client = self.get_client(None)
-        ret = client.mget(keys)
-        return {
-            k: self._serializer.loads(v) for k, v in zip(keys, ret) if v is not None
-        }
-
-    def has_key(self, key):
-        client = self.get_client(key)
-        return bool(client.exists(key))
-
-    def incr(self, key, delta):
-        client = self.get_client(key, write=True)
-        if not client.exists(key):
-            raise ValueError("Key '%s' not found." % key)
-        return client.incr(key, delta)
-
-    def set_many(self, data, timeout):
-        client = self.get_client(None, write=True)
-        pipeline = client.pipeline()
-        pipeline.mset({k: self._serializer.dumps(v) for k, v in data.items()})
-
-        if timeout is not None:
-            # Setting timeout for each key as redis does not support timeout
-            # with mset().
-            for key in data:
-                pipeline.expire(key, timeout)
-        pipeline.execute()
-
-    def delete_many(self, keys):
-        client = self.get_client(None, write=True)
-        client.delete(*keys)
-
-    def clear(self):
-        client = self.get_client(None, write=True)
-        return bool(client.flushdb())
+        try:
+            _patch_rediscluster()
+        except Exception:
+            logger.exception("Error occurred while patching `rediscluster` library")
 
 
-class RedisCache(BaseCache):
-    def __init__(self, server, params):
-        super().__init__(params)
-        if isinstance(server, str):
-            self._servers = re.split("[;,]", server)
-        else:
-            self._servers = server
+def patch_redis_client(cls, is_cluster):
+    # type: (Any, bool) -> None
+    """
+    This function can be used to instrument custom redis client classes or
+    subclasses.
+    """
+    old_execute_command = cls.execute_command
 
-        self._class = RedisCacheClient
-        self._options = params.get("OPTIONS", {})
+    def sentry_patched_execute_command(self, name, *args, **kwargs):
+        # type: (Any, str, *Any, **Any) -> Any
+        hub = Hub.current
 
-    @cached_property
-    def _cache(self):
-        return self._class(self._servers, **self._options)
+        if hub.get_integration(RedisIntegration) is None:
+            return old_execute_command(self, name, *args, **kwargs)
 
-    def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
-        if timeout == DEFAULT_TIMEOUT:
-            timeout = self.default_timeout
-        # The key will be made persistent if None used as a timeout.
-        # Non-positive values will cause the key to be deleted.
-        return None if timeout is None else max(0, int(timeout))
+        description = name
 
-    def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.add(key, value, self.get_backend_timeout(timeout))
+        with capture_internal_exceptions():
+            description_parts = [name]
+            for i, arg in enumerate(args):
+                if i > _MAX_NUM_ARGS:
+                    break
 
-    def get(self, key, default=None, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.get(key, default)
+                description_parts.append(repr(arg))
 
-    def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        self._cache.set(key, value, self.get_backend_timeout(timeout))
+            description = " ".join(description_parts)
 
-    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.touch(key, self.get_backend_timeout(timeout))
+        with hub.start_span(op=OP.DB_REDIS, description=description) as span:
+            span.set_tag("redis.is_cluster", is_cluster)
+            if name:
+                span.set_tag("redis.command", name)
 
-    def delete(self, key, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.delete(key)
+            if name and args:
+                name_low = name.lower()
+                if (name_low in _SINGLE_KEY_COMMANDS) or (
+                    name_low in _MULTI_KEY_COMMANDS and len(args) == 1
+                ):
+                    span.set_tag("redis.key", args[0])
 
-    def get_many(self, keys, version=None):
-        key_map = {
-            self.make_and_validate_key(key, version=version): key for key in keys
-        }
-        ret = self._cache.get_many(key_map.keys())
-        return {key_map[k]: v for k, v in ret.items()}
+            return old_execute_command(self, name, *args, **kwargs)
 
-    def has_key(self, key, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.has_key(key)
-
-    def incr(self, key, delta=1, version=None):
-        key = self.make_and_validate_key(key, version=version)
-        return self._cache.incr(key, delta)
-
-    def set_many(self, data, timeout=DEFAULT_TIMEOUT, version=None):
-        if not data:
-            return []
-        safe_data = {}
-        for key, value in data.items():
-            key = self.make_and_validate_key(key, version=version)
-            safe_data[key] = value
-        self._cache.set_many(safe_data, self.get_backend_timeout(timeout))
-        return []
-
-    def delete_many(self, keys, version=None):
-        if not keys:
-            return
-        safe_keys = [self.make_and_validate_key(key, version=version) for key in keys]
-        self._cache.delete_many(safe_keys)
-
-    def clear(self):
-        return self._cache.clear()
+    cls.execute_command = sentry_patched_execute_command

@@ -1,161 +1,293 @@
-#!/usr/bin/env python3
+# coding: utf-8
+# Copyright: (c) 2019, Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
+
+import asyncio
+import datetime
+import hashlib
+
+import aiohttp
+from jinja2 import Environment, DictLoader
+
+
+VERSION_FRAGMENT = """
+{%- if versions | length > 1 %}
+  {% for version in versions %}
+    {% if loop.last %}and {{ pretty_version(version) }}{% else %}
+      {% if versions | length == 2 %}{{ pretty_version(version) }} {% else %}{{ pretty_version(version) }}, {% endif -%}
+    {% endif -%}
+  {% endfor -%}
+{%- else %}{{ pretty_version(versions[0]) }}{% endif -%}
 """
-Script to generate contributor and pull request lists
 
-This script generates contributor and pull request lists for release
-announcements using GitHub v3 protocol. Use requires an authentication token in
-order to have sufficient bandwidth, you can get one following the directions at
-`<https://help.github.com/articles/creating-an-access-token-for-command-line-use/>_
-Don't add any scope, as the default is read access to public information. The
-token may be stored in an environment variable as you only get one chance to
-see it.
+LONG_TEMPLATE = """
+{% set plural = False if versions | length == 1 else True %}
+{% set latest_ver = (versions | sort(attribute='ver_obj'))[-1] %}
 
-Usage::
+To: ansible-releases@redhat.com, ansible-devel@googlegroups.com, ansible-project@googlegroups.com, ansible-announce@googlegroups.com
+Subject: New release{% if plural %}s{% endif %}: {{ version_str }}
 
-    $ ./scripts/announce.py <token> <revision range>
+{% filter wordwrap %}
+Hi all- we're happy to announce that the general release of {{ version_str }}{% if plural %} are{%- else %} is{%- endif %} now available!
+{% endfilter %}
 
-The output is utf8 rst.
 
-Dependencies
+
+How to get it
+-------------
+
+{% for version in versions %}
+$ pip install ansible{% if is_ansible_base(version) %}-base{% endif %}=={{ version }} --user
+{% if not loop.last %}
+or
+{% endif %}
+{% endfor %}
+
+The tar.gz of the release{% if plural %}s{% endif %} can be found here:
+
+{% for version in versions %}
+* {{ pretty_version(version) }}
+{% if is_ansible_base(version) %}
+  https://pypi.python.org/packages/source/a/ansible-base/ansible-base-{{ version }}.tar.gz
+{% else %}
+  https://pypi.python.org/packages/source/a/ansible/ansible-{{ version }}.tar.gz
+{% endif %}
+  SHA256: {{ hashes[version] }}
+{% endfor %}
+
+
+What's new in {{ version_str }}
+{{ '-' * (14 + version_str | length) }}
+
+{% filter wordwrap %}
+{% if plural %}These releases are{% else %}This release is a{% endif %} maintenance release{% if plural %}s{% endif %} containing numerous bugfixes. The full {% if plural %} changelogs are{% else %} changelog is{% endif %} at:
+{% endfilter %}
+
+
+{% for version in versions %}
+* {{ version }}
+  https://github.com/ansible/ansible/blob/stable-{{ version.split('.')[:2] | join('.') }}/changelogs/CHANGELOG-v{{ version.split('.')[:2] | join('.') }}.rst
+{% endfor %}
+
+
+What's the schedule for future maintenance releases?
+----------------------------------------------------
+
+{% filter wordwrap %}
+Future maintenance releases will occur approximately every 3 weeks. So expect the next one around {{ next_release.strftime('%Y-%m-%d') }}.
+{% endfilter %}
+
+
+
+Porting Help
 ------------
 
-- gitpython
-- pygithub
-
-Some code was copied from scipy `tools/gh_lists.py` and `tools/authors.py`.
-
-Examples
---------
-
-From the bash command line with $GITHUB token.
-
-    $ ./scripts/announce.py $GITHUB v1.11.0..v1.11.1 > announce.rst
-
-"""
-import codecs
-import os
-import re
-import textwrap
-
-from git import Repo
-
-UTF8Writer = codecs.getwriter("utf8")
-this_repo = Repo(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-author_msg = """\
-A total of %d people contributed patches to this release.  People with a
-"+" by their names contributed a patch for the first time.
-"""
-
-pull_request_msg = """\
-A total of %d pull requests were merged for this release.
-"""
+{% filter wordwrap %}
+We've published a porting guide at
+https://docs.ansible.com/ansible/devel/porting_guides/porting_guide_{{ latest_ver.split('.')[:2] | join('.') }}.html to help migrate your content to {{ latest_ver.split('.')[:2] | join('.') }}.
+{% endfilter %}
 
 
-def get_authors(revision_range):
-    pat = "^.*\\t(.*)$"
-    lst_release, cur_release = (r.strip() for r in revision_range.split(".."))
 
-    if "|" in cur_release:
-        # e.g. v1.0.1|HEAD
-        maybe_tag, head = cur_release.split("|")
-        assert head == "HEAD"
-        if maybe_tag in this_repo.tags:
-            cur_release = maybe_tag
-        else:
-            cur_release = head
-        revision_range = f"{lst_release}..{cur_release}"
+{% filter wordwrap %}
+If you discover any errors or if any of your working playbooks break when you upgrade to {{ latest_ver }}, please use the following link to report the regression:
+{% endfilter %}
 
-    # authors, in current release and previous to current release.
-    # We need two passes over the log for cur and prev, one to get the
-    # "Co-authored by" commits, which come from backports by the bot,
-    # and one for regular commits.
-    xpr = re.compile(r"Co-authored-by: (?P<name>[^<]+) ")
-    cur = set(
-        xpr.findall(
-            this_repo.git.log("--grep=Co-authored", "--pretty=%b", revision_range)
-        )
+
+  https://github.com/ansible/ansible/issues/new/choose
+
+{% filter wordwrap %}
+In your issue, be sure to mention the version that works and the one that doesn't.
+{% endfilter %}
+
+
+Thanks!
+
+-{{ name }}
+
+"""  # noqa for E501 (line length).
+# jinja2 is horrid about getting rid of extra newlines so we have to have a single per paragraph for
+# proper wrapping to occur
+
+SHORT_TEMPLATE = """
+{% set plural = False if versions | length == 1 else True %}
+{% set version = (versions|sort(attribute='ver_obj'))[-1] %}
+@ansible
+{{ version_str }}
+{% if plural %}
+  have
+{% else %}
+  has
+{% endif %}
+been released! Get
+{% if plural %}
+them
+{% else %}
+it
+{% endif %}
+on PyPI: pip install ansible{% if is_ansible_base(version) %}-base{% endif %}=={{ version }},
+the Ansible PPA on Launchpad, or GitHub. Happy automating!
+"""  # noqa for E501 (line length).
+# jinja2 is horrid about getting rid of extra newlines so we have to have a single per paragraph for
+# proper wrapping to occur
+
+JINJA_ENV = Environment(
+    loader=DictLoader({'long': LONG_TEMPLATE,
+                       'short': SHORT_TEMPLATE,
+                       'version_string': VERSION_FRAGMENT,
+                       }),
+    extensions=['jinja2.ext.i18n'],
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+
+async def calculate_hash_from_tarball(session, version):
+    tar_url = f'https://pypi.python.org/packages/source/a/ansible-base/ansible-base-{version}.tar.gz'
+    tar_task = asyncio.create_task(session.get(tar_url))
+    tar_response = await tar_task
+
+    tar_hash = hashlib.sha256()
+    while True:
+        chunk = await tar_response.content.read(1024)
+        if not chunk:
+            break
+        tar_hash.update(chunk)
+
+    return tar_hash.hexdigest()
+
+
+async def parse_hash_from_file(session, version):
+    filename = f'ansible-base-{version}.tar.gz'
+    hash_url = f'https://releases.ansible.com/ansible-base/{filename}.sha'
+    hash_task = asyncio.create_task(session.get(hash_url))
+    hash_response = await hash_task
+
+    hash_content = await hash_response.read()
+    precreated_hash, precreated_filename = hash_content.split(None, 1)
+    if filename != precreated_filename.strip().decode('utf-8'):
+        raise ValueError(f'Hash file contains hash for a different file: {precreated_filename}')
+
+    return precreated_hash.decode('utf-8')
+
+
+async def get_hash(session, version):
+    calculated_hash = await calculate_hash_from_tarball(session, version)
+    precreated_hash = await parse_hash_from_file(session, version)
+
+    if calculated_hash != precreated_hash:
+        raise ValueError(f'Hash in file ansible-base-{version}.tar.gz.sha {precreated_hash} does not'
+                         f' match hash of tarball from pypi {calculated_hash}')
+
+    return calculated_hash
+
+
+async def get_hashes(versions):
+    hashes = {}
+    requestors = {}
+    async with aiohttp.ClientSession() as aio_session:
+        for version in versions:
+            requestors[version] = asyncio.create_task(get_hash(aio_session, version))
+
+        for version, request in requestors.items():
+            await request
+            hashes[version] = request.result()
+
+    return hashes
+
+
+def next_release_date(weeks=3):
+    days_in_the_future = weeks * 7
+    today = datetime.datetime.now()
+    numeric_today = today.weekday()
+
+    # We release on Thursdays
+    if numeric_today == 3:
+        # 3 is Thursday
+        pass
+    elif numeric_today == 4:
+        # If this is Friday, we can adjust back to Thursday for the next release
+        today -= datetime.timedelta(days=1)
+    elif numeric_today < 3:
+        # Otherwise, slide forward to Thursday
+        today += datetime.timedelta(days=(3 - numeric_today))
+    else:
+        # slightly different formula if it's past Thursday this week.  We need to go forward to
+        # Thursday of next week
+        today += datetime.timedelta(days=(10 - numeric_today))
+
+    next_release = today + datetime.timedelta(days=days_in_the_future)
+    return next_release
+
+
+def is_ansible_base(version):
+    '''
+    Determines if a version is an ansible-base version or not, by checking
+    if it is >= 2.10.0. Stops comparing when it gets to the first non-numeric
+    component to allow for .dev and .beta suffixes.
+    '''
+    # Ignore .beta/.dev suffixes
+    ver_split = []
+    for component in version.split('.'):
+        if not component.isdigit():
+            if 'rc' in component:
+                ver_split.append(int(component.split('rc')[0]))
+            if 'b' in component:
+                ver_split.append(int(component.split('b')[0]))
+            continue
+        ver_split.append(int(component))
+    return tuple(ver_split) >= (2, 10, 0)
+
+
+# Currently only use with a single element list, but left general for later
+# in case we need to refer to the releases collectively.
+def release_variants(versions):
+    if all(is_ansible_base(v) for v in versions):
+        return 'ansible-base'
+
+    if all(not is_ansible_base(v) for v in versions):
+        return 'Ansible'
+
+    return 'Ansible and ansible-base'
+
+
+def pretty_version(version):
+    return '{0} {1}'.format(
+        release_variants([version]),
+        version,
     )
-    cur |= set(re.findall(pat, this_repo.git.shortlog("-s", revision_range), re.M))
-
-    pre = set(
-        xpr.findall(this_repo.git.log("--grep=Co-authored", "--pretty=%b", lst_release))
-    )
-    pre |= set(re.findall(pat, this_repo.git.shortlog("-s", lst_release), re.M))
-
-    # Homu is the author of auto merges, clean him out.
-    cur.discard("Homu")
-    pre.discard("Homu")
-
-    # Append '+' to new authors.
-    authors = [s + " +" for s in cur - pre] + list(cur & pre)
-    authors.sort()
-    return authors
 
 
-def get_pull_requests(repo, revision_range):
-    prnums = []
+def create_long_message(versions, name):
+    hashes = asyncio.run(get_hashes(versions))
 
-    # From regular merges
-    merges = this_repo.git.log("--oneline", "--merges", revision_range)
-    issues = re.findall("Merge pull request \\#(\\d*)", merges)
-    prnums.extend(int(s) for s in issues)
+    version_template = JINJA_ENV.get_template('version_string')
+    version_str = version_template.render(versions=versions,
+                                          pretty_version=pretty_version).strip()
 
-    # From Homu merges (Auto merges)
-    issues = re.findall("Auto merge of \\#(\\d*)", merges)
-    prnums.extend(int(s) for s in issues)
+    next_release = next_release_date()
 
-    # From fast forward squash-merges
-    commits = this_repo.git.log(
-        "--oneline", "--no-merges", "--first-parent", revision_range
-    )
-    issues = re.findall("^.*\\(\\#(\\d+)\\)$", commits, re.M)
-    prnums.extend(int(s) for s in issues)
-
-    # get PR data from GitHub repo
-    prnums.sort()
-    prs = [repo.get_pull(n) for n in prnums]
-    return prs
+    template = JINJA_ENV.get_template('long')
+    message = template.render(versions=versions, version_str=version_str,
+                              name=name, hashes=hashes, next_release=next_release,
+                              is_ansible_base=is_ansible_base,
+                              pretty_version=pretty_version)
+    return message
 
 
-def build_components(revision_range, heading="Contributors"):
-    lst_release, cur_release = (r.strip() for r in revision_range.split(".."))
-    authors = get_authors(revision_range)
+def create_short_message(versions):
+    version_template = JINJA_ENV.get_template('version_string')
+    version_str = version_template.render(versions=versions,
+                                          pretty_version=pretty_version).strip()
 
-    return {
-        "heading": heading,
-        "author_message": author_msg % len(authors),
-        "authors": authors,
-    }
-
-
-def build_string(revision_range, heading="Contributors"):
-    components = build_components(revision_range, heading=heading)
-    components["uline"] = "=" * len(components["heading"])
-    components["authors"] = "* " + "\n* ".join(components["authors"])
-
-    # Don't change this to an fstring. It breaks the formatting.
-    tpl = textwrap.dedent(
-        """\
-    {heading}
-    {uline}
-
-    {author_message}
-    {authors}"""
-    ).format(**components)
-    return tpl
-
-
-def main(revision_range):
-    # document authors
-    text = build_string(revision_range)
-    print(text)
-
-
-if __name__ == "__main__":
-    from argparse import ArgumentParser
-
-    parser = ArgumentParser(description="Generate author lists for release")
-    parser.add_argument("revision_range", help="<revision>..<revision>")
-    args = parser.parse_args()
-    main(args.revision_range)
+    template = JINJA_ENV.get_template('short')
+    message = template.render(versions=versions, version_str=version_str,
+                              is_ansible_base=is_ansible_base,
+                              pretty_version=pretty_version)
+    message = ' '.join(message.split()) + '\n'
+    return message

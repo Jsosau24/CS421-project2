@@ -1,47 +1,41 @@
-import pytest
-
-from sklearn.base import BaseEstimator
-from sklearn.utils._tags import (
-    _DEFAULT_TAGS,
-    _safe_tags,
-)
-
-
-class NoTagsEstimator:
+try:
+    from selenium.webdriver.common.by import By
+except ImportError:
     pass
 
-
-class MoreTagsEstimator:
-    def _more_tags(self):
-        return {"allow_nan": True}
+from mailpile.tests.gui import MailpileSeleniumTest
 
 
-@pytest.mark.parametrize(
-    "estimator, err_msg",
-    [
-        (BaseEstimator(), "The key xxx is not defined in _get_tags"),
-        (NoTagsEstimator(), "The key xxx is not defined in _DEFAULT_TAGS"),
-    ],
-)
-def test_safe_tags_error(estimator, err_msg):
-    # Check that safe_tags raises error in ambiguous case.
-    with pytest.raises(ValueError, match=err_msg):
-        _safe_tags(estimator, key="xxx")
+class TagGuiTest(MailpileSeleniumTest):
+    def test_mark_read_unread(self):
+        return  # FIXME: Test disabled
 
+        self.go_to_mailpile_home()
+        self.wait_until_element_is_visible('pile-message-2')
+        self._assert_element_has_class('pile-message-2', 'in_new')
+        self._toggle_tag_bar()
+        self._click_on_visible_element_with_class_name('bulk-action-read')
+        self._assert_element_not_class('pile-message-2', 'in_new')
+        self._toggle_tag_bar()
+        self.wait_until_element_is_invisible_by_locator((By.CLASS_NAME, 'bulk-action-read'))
+        self._toggle_tag_bar()
+        self._click_on_visible_element_with_class_name('bulk-action-unread')
+        self._assert_element_has_class('pile-message-2', 'in_new')
+        self._toggle_tag_bar()
+        self.wait_until_element_is_invisible_by_locator((By.CLASS_NAME, 'bulk-action-unread'))
 
-@pytest.mark.parametrize(
-    "estimator, key, expected_results",
-    [
-        (NoTagsEstimator(), None, _DEFAULT_TAGS),
-        (NoTagsEstimator(), "allow_nan", _DEFAULT_TAGS["allow_nan"]),
-        (MoreTagsEstimator(), None, {**_DEFAULT_TAGS, **{"allow_nan": True}}),
-        (MoreTagsEstimator(), "allow_nan", True),
-        (BaseEstimator(), None, _DEFAULT_TAGS),
-        (BaseEstimator(), "allow_nan", _DEFAULT_TAGS["allow_nan"]),
-        (BaseEstimator(), "allow_nan", _DEFAULT_TAGS["allow_nan"]),
-    ],
-)
-def test_safe_tags_no_get_tags(estimator, key, expected_results):
-    # check the behaviour of _safe_tags when an estimator does not implement
-    # _get_tags
-    assert _safe_tags(estimator, key=key) == expected_results
+    def _click_on_visible_element_with_class_name(self, class_name):
+        self.wait_until_element_is_visible_by_locator((By.CLASS_NAME, class_name))
+        unread_btn = self.find_element_by_class_name(class_name)
+        unread_btn.click()
+
+    def _toggle_tag_bar(self):
+        checkbox = self.find_element_by_xpath('//*[@id="pile-message-2"]/td[6]/input')
+        checkbox.click()
+        return checkbox
+
+    def _assert_element_has_class(self, element_id, class_name):
+        self.wait_until_element_has_class((By.ID, element_id), class_name)
+
+    def _assert_element_not_class(self, element_id, class_name):
+        self.wait_until_element_has_not_class((By.ID, element_id), class_name)

@@ -1,126 +1,86 @@
-"""
-A class for storing a tree graph. Primarily used for filter constructs in the
-ORM.
-"""
+# (c) 2012-2014, Ansible, Inc
+# (c) 2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-import copy
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
 
-from django.utils.hashable import make_hashable
+DOCUMENTATION = '''
+    name: tree
+    type: notification
+    requirements:
+      - invoked in the command line
+    short_description: Save host events to files
+    version_added: "2.0"
+    options:
+        directory:
+            version_added: '2.11'
+            description: directory that will contain the per host JSON files. Also set by the C(--tree) option when using adhoc.
+            ini:
+                - section: callback_tree
+                  key: directory
+            env:
+                - name: ANSIBLE_CALLBACK_TREE_DIR
+            default: "~/.ansible/tree"
+            type: path
+    description:
+        - "This callback is used by the Ansible (adhoc) command line option C(-t|--tree)."
+        - This produces a JSON dump of events in a directory, a file for each host, the directory used MUST be passed as a command line option.
+'''
+
+import os
+
+from ansible.constants import TREE_DIR
+from ansible.module_utils._text import to_bytes, to_text
+from ansible.plugins.callback import CallbackBase
+from ansible.utils.path import makedirs_safe, unfrackpath
 
 
-class Node:
-    """
-    A single internal node in the tree graph. A Node should be viewed as a
-    connection (the root) with the children being either leaf nodes or other
-    Node instances.
-    """
+class CallbackModule(CallbackBase):
+    '''
+    This callback puts results into a host specific file in a directory in json format.
+    '''
 
-    # Standard connector type. Clients usually won't use this at all and
-    # subclasses will usually override the value.
-    default = "DEFAULT"
+    CALLBACK_VERSION = 2.0
+    CALLBACK_TYPE = 'aggregate'
+    CALLBACK_NAME = 'tree'
+    CALLBACK_NEEDS_ENABLED = True
 
-    def __init__(self, children=None, connector=None, negated=False):
-        """Construct a new Node. If no connector is given, use the default."""
-        self.children = children[:] if children else []
-        self.connector = connector or self.default
-        self.negated = negated
+    def set_options(self, task_keys=None, var_options=None, direct=None):
+        ''' override to set self.tree '''
 
-    @classmethod
-    def create(cls, children=None, connector=None, negated=False):
-        """
-        Create a new instance using Node() instead of __init__() as some
-        subclasses, e.g. django.db.models.query_utils.Q, may implement a custom
-        __init__() with a signature that conflicts with the one defined in
-        Node.__init__().
-        """
-        obj = Node(children, connector or cls.default, negated)
-        obj.__class__ = cls
-        return obj
+        super(CallbackModule, self).set_options(task_keys=task_keys, var_options=var_options, direct=direct)
 
-    def __str__(self):
-        template = "(NOT (%s: %s))" if self.negated else "(%s: %s)"
-        return template % (self.connector, ", ".join(str(c) for c in self.children))
-
-    def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__name__, self)
-
-    def __copy__(self):
-        obj = self.create(connector=self.connector, negated=self.negated)
-        obj.children = self.children  # Don't [:] as .__init__() via .create() does.
-        return obj
-
-    copy = __copy__
-
-    def __deepcopy__(self, memodict):
-        obj = self.create(connector=self.connector, negated=self.negated)
-        obj.children = copy.deepcopy(self.children, memodict)
-        return obj
-
-    def __len__(self):
-        """Return the number of children this node has."""
-        return len(self.children)
-
-    def __bool__(self):
-        """Return whether or not this node has children."""
-        return bool(self.children)
-
-    def __contains__(self, other):
-        """Return True if 'other' is a direct child of this instance."""
-        return other in self.children
-
-    def __eq__(self, other):
-        return (
-            self.__class__ == other.__class__
-            and self.connector == other.connector
-            and self.negated == other.negated
-            and self.children == other.children
-        )
-
-    def __hash__(self):
-        return hash(
-            (
-                self.__class__,
-                self.connector,
-                self.negated,
-                *make_hashable(self.children),
-            )
-        )
-
-    def add(self, data, conn_type):
-        """
-        Combine this tree and the data represented by data using the
-        connector conn_type. The combine is done by squashing the node other
-        away if possible.
-
-        This tree (self) will never be pushed to a child node of the
-        combined tree, nor will the connector or negated properties change.
-
-        Return a node which can be used in place of data regardless if the
-        node other got squashed or not.
-        """
-        if self.connector != conn_type:
-            obj = self.copy()
-            self.connector = conn_type
-            self.children = [obj, data]
-            return data
-        elif (
-            isinstance(data, Node)
-            and not data.negated
-            and (data.connector == conn_type or len(data) == 1)
-        ):
-            # We can squash the other node's children directly into this node.
-            # We are just doing (AB)(CD) == (ABCD) here, with the addition that
-            # if the length of the other node is 1 the connector doesn't
-            # matter. However, for the len(self) == 1 case we don't want to do
-            # the squashing, as it would alter self.connector.
-            self.children.extend(data.children)
-            return self
+        if TREE_DIR:
+            # TREE_DIR comes from the CLI option --tree, only available for adhoc
+            self.tree = unfrackpath(TREE_DIR)
         else:
-            # We could use perhaps additional logic here to see if some
-            # children could be used for pushdown here.
-            self.children.append(data)
-            return data
+            self.tree = self.get_option('directory')
 
-    def negate(self):
-        """Negate the sense of the root connector."""
-        self.negated = not self.negated
+    def write_tree_file(self, hostname, buf):
+        ''' write something into treedir/hostname '''
+
+        buf = to_bytes(buf)
+        try:
+            makedirs_safe(self.tree)
+        except (OSError, IOError) as e:
+            self._display.warning(u"Unable to access or create the configured directory (%s): %s" % (to_text(self.tree), to_text(e)))
+
+        try:
+            path = to_bytes(os.path.join(self.tree, hostname))
+            with open(path, 'wb+') as fd:
+                fd.write(buf)
+        except (OSError, IOError) as e:
+            self._display.warning(u"Unable to write to %s's file: %s" % (hostname, to_text(e)))
+
+    def result_to_tree(self, result):
+        self.write_tree_file(result._host.get_name(), self._dump_results(result._result))
+
+    def v2_runner_on_ok(self, result):
+        self.result_to_tree(result)
+
+    def v2_runner_on_failed(self, result, ignore_errors=False):
+        self.result_to_tree(result)
+
+    def v2_runner_on_unreachable(self, result):
+        self.result_to_tree(result)

@@ -1,62 +1,50 @@
 """
-Unopinionated display configuration.
+pprint and pformat wrappers with colorization support
 """
 
-from __future__ import annotations
-
-import locale
+import ctypes
+import platform
 import sys
+from pprint import pformat as pformat_
 
-from pandas._config import config as cf
-
-# -----------------------------------------------------------------------------
-# Global formatting options
-_initial_defencoding: str | None = None
+from packaging.version import Version as parse_version
 
 
-def detect_console_encoding() -> str:
-    """
-    Try to find the most capable encoding supported by the console.
-    slightly modified from the way IPython handles the same issue.
-    """
-    global _initial_defencoding
+def _enable_windows_terminal_processing():
+    # https://stackoverflow.com/a/36760881
+    kernel32 = ctypes.windll.kernel32
+    return bool(kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7))
 
-    encoding = None
+
+def _tty_supports_color():
+    if sys.platform != "win32":
+        return True
+
+    if parse_version(platform.version()) < parse_version("10.0.14393"):
+        return True
+
+    # Windows >= 10.0.14393 interprets ANSI escape sequences providing terminal
+    # processing is enabled.
+    return _enable_windows_terminal_processing()
+
+
+def _colorize(text, colorize=True):
+    if not colorize or not sys.stdout.isatty() or not _tty_supports_color():
+        return text
     try:
-        encoding = sys.stdout.encoding or sys.stdin.encoding
-    except (AttributeError, OSError):
-        pass
+        from pygments import highlight
+    except ImportError:
+        return text
+    else:
+        from pygments.formatters import TerminalFormatter
+        from pygments.lexers import PythonLexer
 
-    # try again for something better
-    if not encoding or "ascii" in encoding.lower():
-        try:
-            encoding = locale.getpreferredencoding()
-        except locale.Error:
-            # can be raised by locale.setlocale(), which is
-            #  called by getpreferredencoding
-            #  (on some systems, see stdlib locale docs)
-            pass
-
-    # when all else fails. this will usually be "ascii"
-    if not encoding or "ascii" in encoding.lower():
-        encoding = sys.getdefaultencoding()
-
-    # GH#3360, save the reported defencoding at import time
-    # MPL backends may change it. Make available for debugging.
-    if not _initial_defencoding:
-        _initial_defencoding = sys.getdefaultencoding()
-
-    return encoding
+        return highlight(text, PythonLexer(), TerminalFormatter())
 
 
-pc_encoding_doc = """
-: str/unicode
-    Defaults to the detected encoding of the console.
-    Specifies the encoding to be used for strings returned by to_string,
-    these are generally strings meant to be displayed on the console.
-"""
+def pformat(obj, *args, **kwargs):
+    return _colorize(pformat_(obj), kwargs.pop("colorize", True))
 
-with cf.config_prefix("display"):
-    cf.register_option(
-        "encoding", detect_console_encoding(), pc_encoding_doc, validator=cf.is_text
-    )
+
+def pprint(obj, *args, **kwargs):
+    print(pformat(obj, *args, **kwargs))

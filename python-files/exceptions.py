@@ -1,165 +1,141 @@
 """
-The :mod:`sklearn.exceptions` module includes all custom warnings and error
-classes used across scikit-learn.
+requests.exceptions
+~~~~~~~~~~~~~~~~~~~
+
+This module contains the set of Requests' exceptions.
 """
+from urllib3.exceptions import HTTPError as BaseHTTPError
 
-__all__ = [
-    "NotFittedError",
-    "ConvergenceWarning",
-    "DataConversionWarning",
-    "DataDimensionalityWarning",
-    "EfficiencyWarning",
-    "FitFailedWarning",
-    "SkipTestWarning",
-    "UndefinedMetricWarning",
-    "PositiveSpectrumWarning",
-]
+from .compat import JSONDecodeError as CompatJSONDecodeError
 
 
-class NotFittedError(ValueError, AttributeError):
-    """Exception class to raise if estimator is used before fitting.
+class RequestException(IOError):
+    """There was an ambiguous exception that occurred while handling your
+    request.
+    """
 
-    This class inherits from both ValueError and AttributeError to help with
-    exception handling and backward compatibility.
+    def __init__(self, *args, **kwargs):
+        """Initialize RequestException with `request` and `response` objects."""
+        response = kwargs.pop("response", None)
+        self.response = response
+        self.request = kwargs.pop("request", None)
+        if response is not None and not self.request and hasattr(response, "request"):
+            self.request = self.response.request
+        super().__init__(*args, **kwargs)
 
-    Examples
-    --------
-    >>> from sklearn.svm import LinearSVC
-    >>> from sklearn.exceptions import NotFittedError
-    >>> try:
-    ...     LinearSVC().predict([[1, 2], [2, 3], [3, 4]])
-    ... except NotFittedError as e:
-    ...     print(repr(e))
-    NotFittedError("This LinearSVC instance is not fitted yet. Call 'fit' with
-    appropriate arguments before using this estimator."...)
 
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.validation.
+class InvalidJSONError(RequestException):
+    """A JSON error occurred."""
+
+
+class JSONDecodeError(InvalidJSONError, CompatJSONDecodeError):
+    """Couldn't decode the text into json"""
+
+    def __init__(self, *args, **kwargs):
+        """
+        Construct the JSONDecodeError instance first with all
+        args. Then use it's args to construct the IOError so that
+        the json specific args aren't used as IOError specific args
+        and the error message from JSONDecodeError is preserved.
+        """
+        CompatJSONDecodeError.__init__(self, *args)
+        InvalidJSONError.__init__(self, *self.args, **kwargs)
+
+
+class HTTPError(RequestException):
+    """An HTTP error occurred."""
+
+
+class ConnectionError(RequestException):
+    """A Connection error occurred."""
+
+
+class ProxyError(ConnectionError):
+    """A proxy error occurred."""
+
+
+class SSLError(ConnectionError):
+    """An SSL error occurred."""
+
+
+class Timeout(RequestException):
+    """The request timed out.
+
+    Catching this error will catch both
+    :exc:`~requests.exceptions.ConnectTimeout` and
+    :exc:`~requests.exceptions.ReadTimeout` errors.
     """
 
 
-class ConvergenceWarning(UserWarning):
-    """Custom warning to capture convergence problems
+class ConnectTimeout(ConnectionError, Timeout):
+    """The request timed out while trying to connect to the remote server.
 
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.
+    Requests that produced this error are safe to retry.
     """
 
 
-class DataConversionWarning(UserWarning):
-    """Warning used to notify implicit data conversions happening in the code.
-
-    This warning occurs when some input data needs to be converted or
-    interpreted in a way that may not match the user's expectations.
-
-    For example, this warning may occur when the user
-        - passes an integer array to a function which expects float input and
-          will convert the input
-        - requests a non-copying operation, but a copy is required to meet the
-          implementation's data-type expectations;
-        - passes an input whose shape can be interpreted ambiguously.
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.validation.
-    """
+class ReadTimeout(Timeout):
+    """The server did not send any data in the allotted amount of time."""
 
 
-class DataDimensionalityWarning(UserWarning):
-    """Custom warning to notify potential issues with data dimensionality.
-
-    For example, in random projection, this warning is raised when the
-    number of components, which quantifies the dimensionality of the target
-    projection space, is higher than the number of features, which quantifies
-    the dimensionality of the original source space, to imply that the
-    dimensionality of the problem will not be reduced.
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.
-    """
+class URLRequired(RequestException):
+    """A valid URL is required to make a request."""
 
 
-class EfficiencyWarning(UserWarning):
-    """Warning used to notify the user of inefficient computation.
-
-    This warning notifies the user that the efficiency may not be optimal due
-    to some reason which may be included as a part of the warning message.
-    This may be subclassed into a more specific Warning class.
-
-    .. versionadded:: 0.18
-    """
+class TooManyRedirects(RequestException):
+    """Too many redirects."""
 
 
-class FitFailedWarning(RuntimeWarning):
-    """Warning class used if there is an error while fitting the estimator.
-
-    This Warning is used in meta estimators GridSearchCV and RandomizedSearchCV
-    and the cross-validation helper function cross_val_score to warn when there
-    is an error while fitting the estimator.
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.cross_validation.
-    """
+class MissingSchema(RequestException, ValueError):
+    """The URL scheme (e.g. http or https) is missing."""
 
 
-class SkipTestWarning(UserWarning):
-    """Warning class used to notify the user of a test that was skipped.
-
-    For example, one of the estimator checks requires a pandas import.
-    If the pandas package cannot be imported, the test will be skipped rather
-    than register as a failure.
-    """
+class InvalidSchema(RequestException, ValueError):
+    """The URL scheme provided is either invalid or unsupported."""
 
 
-class UndefinedMetricWarning(UserWarning):
-    """Warning used when the metric is invalid
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.base.
-    """
+class InvalidURL(RequestException, ValueError):
+    """The URL provided was somehow invalid."""
 
 
-class PositiveSpectrumWarning(UserWarning):
-    """Warning raised when the eigenvalues of a PSD matrix have issues
-
-    This warning is typically raised by ``_check_psd_eigenvalues`` when the
-    eigenvalues of a positive semidefinite (PSD) matrix such as a gram matrix
-    (kernel) present significant negative eigenvalues, or bad conditioning i.e.
-    very small non-zero eigenvalues compared to the largest eigenvalue.
-
-    .. versionadded:: 0.22
-    """
+class InvalidHeader(RequestException, ValueError):
+    """The header value provided was somehow invalid."""
 
 
-class InconsistentVersionWarning(UserWarning):
-    """Warning raised when an estimator is unpickled with a inconsistent version.
+class InvalidProxyURL(InvalidURL):
+    """The proxy URL provided is invalid."""
 
-    Parameters
-    ----------
-    estimator_name : str
-        Estimator name.
 
-    current_sklearn_version : str
-        Current scikit-learn version.
+class ChunkedEncodingError(RequestException):
+    """The server declared chunked encoding but sent an invalid chunk."""
 
-    original_sklearn_version : str
-        Original scikit-learn version.
-    """
 
-    def __init__(
-        self, *, estimator_name, current_sklearn_version, original_sklearn_version
-    ):
-        self.estimator_name = estimator_name
-        self.current_sklearn_version = current_sklearn_version
-        self.original_sklearn_version = original_sklearn_version
+class ContentDecodingError(RequestException, BaseHTTPError):
+    """Failed to decode response content."""
 
-    def __str__(self):
-        return (
-            f"Trying to unpickle estimator {self.estimator_name} from version"
-            f" {self.original_sklearn_version} when "
-            f"using version {self.current_sklearn_version}. This might lead to breaking"
-            " code or "
-            "invalid results. Use at your own risk. "
-            "For more info please refer to:\n"
-            "https://scikit-learn.org/stable/model_persistence.html"
-            "#security-maintainability-limitations"
-        )
+
+class StreamConsumedError(RequestException, TypeError):
+    """The content for this response was already consumed."""
+
+
+class RetryError(RequestException):
+    """Custom retries logic failed"""
+
+
+class UnrewindableBodyError(RequestException):
+    """Requests encountered an error when trying to rewind a body."""
+
+
+# Warnings
+
+
+class RequestsWarning(Warning):
+    """Base warning for Requests."""
+
+
+class FileModeWarning(RequestsWarning, DeprecationWarning):
+    """A file was opened in text mode, but Requests determined its binary length."""
+
+
+class RequestsDependencyWarning(RequestsWarning):
+    """An imported dependency doesn't match the expected version range."""

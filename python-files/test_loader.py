@@ -1,675 +1,592 @@
-import compileall
-import os
-from importlib import import_module
+import dataclasses
+import unittest
 
-from django.db import connection, connections
-from django.db.migrations.exceptions import (
-    AmbiguityError,
-    InconsistentMigrationHistory,
-    NodeNotFoundError,
-)
-from django.db.migrations.loader import MigrationLoader
-from django.db.migrations.recorder import MigrationRecorder
-from django.test import TestCase, modify_settings, override_settings
+import attr
+from itemadapter import ItemAdapter
+from itemloaders.processors import Compose, Identity, MapCompose, TakeFirst
 
-from .test_base import MigrationTestBase
+from scrapy.http import HtmlResponse, Response
+from scrapy.item import Field, Item
+from scrapy.loader import ItemLoader
+from scrapy.selector import Selector
 
 
-class RecorderTests(TestCase):
+# test items
+class NameItem(Item):
+    name = Field()
+
+
+class TestItem(NameItem):
+    url = Field()
+    summary = Field()
+
+
+class TestNestedItem(Item):
+    name = Field()
+    name_div = Field()
+    name_value = Field()
+
+    url = Field()
+    image = Field()
+
+
+@attr.s
+class AttrsNameItem:
+    name = attr.ib(default="")
+
+
+@dataclasses.dataclass
+class TestDataClass:
+    name: list = dataclasses.field(default_factory=list)
+
+
+# test item loaders
+class NameItemLoader(ItemLoader):
+    default_item_class = TestItem
+
+
+class NestedItemLoader(ItemLoader):
+    default_item_class = TestNestedItem
+
+
+class TestItemLoader(NameItemLoader):
+    name_in = MapCompose(lambda v: v.title())
+
+
+class DefaultedItemLoader(NameItemLoader):
+    default_input_processor = MapCompose(lambda v: v[:-1])
+
+
+# test processors
+def processor_with_args(value, other=None, loader_context=None):
+    if "key" in loader_context:
+        return loader_context["key"]
+    return value
+
+
+class BasicItemLoaderTest(unittest.TestCase):
+    def test_add_value_on_unknown_field(self):
+        il = TestItemLoader()
+        self.assertRaises(KeyError, il.add_value, "wrong_field", ["lala", "lolo"])
+
+    def test_load_item_using_default_loader(self):
+        i = TestItem()
+        i["summary"] = "lala"
+        il = ItemLoader(item=i)
+        il.add_value("name", "marta")
+        item = il.load_item()
+        assert item is i
+        self.assertEqual(item["summary"], ["lala"])
+        self.assertEqual(item["name"], ["marta"])
+
+    def test_load_item_using_custom_loader(self):
+        il = TestItemLoader()
+        il.add_value("name", "marta")
+        item = il.load_item()
+        self.assertEqual(item["name"], ["Marta"])
+
+
+class InitializationTestMixin:
+    item_class = None
+
+    def test_keep_single_value(self):
+        """Loaded item should contain values from the initial item"""
+        input_item = self.item_class(name="foo")
+        il = ItemLoader(item=input_item)
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(ItemAdapter(loaded_item).asdict(), {"name": ["foo"]})
+
+    def test_keep_list(self):
+        """Loaded item should contain values from the initial item"""
+        input_item = self.item_class(name=["foo", "bar"])
+        il = ItemLoader(item=input_item)
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(ItemAdapter(loaded_item).asdict(), {"name": ["foo", "bar"]})
+
+    def test_add_value_singlevalue_singlevalue(self):
+        """Values added after initialization should be appended"""
+        input_item = self.item_class(name="foo")
+        il = ItemLoader(item=input_item)
+        il.add_value("name", "bar")
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(ItemAdapter(loaded_item).asdict(), {"name": ["foo", "bar"]})
+
+    def test_add_value_singlevalue_list(self):
+        """Values added after initialization should be appended"""
+        input_item = self.item_class(name="foo")
+        il = ItemLoader(item=input_item)
+        il.add_value("name", ["item", "loader"])
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(
+            ItemAdapter(loaded_item).asdict(), {"name": ["foo", "item", "loader"]}
+        )
+
+    def test_add_value_list_singlevalue(self):
+        """Values added after initialization should be appended"""
+        input_item = self.item_class(name=["foo", "bar"])
+        il = ItemLoader(item=input_item)
+        il.add_value("name", "qwerty")
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(
+            ItemAdapter(loaded_item).asdict(), {"name": ["foo", "bar", "qwerty"]}
+        )
+
+    def test_add_value_list_list(self):
+        """Values added after initialization should be appended"""
+        input_item = self.item_class(name=["foo", "bar"])
+        il = ItemLoader(item=input_item)
+        il.add_value("name", ["item", "loader"])
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(
+            ItemAdapter(loaded_item).asdict(),
+            {"name": ["foo", "bar", "item", "loader"]},
+        )
+
+    def test_get_output_value_singlevalue(self):
+        """Getting output value must not remove value from item"""
+        input_item = self.item_class(name="foo")
+        il = ItemLoader(item=input_item)
+        self.assertEqual(il.get_output_value("name"), ["foo"])
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(ItemAdapter(loaded_item).asdict(), dict({"name": ["foo"]}))
+
+    def test_get_output_value_list(self):
+        """Getting output value must not remove value from item"""
+        input_item = self.item_class(name=["foo", "bar"])
+        il = ItemLoader(item=input_item)
+        self.assertEqual(il.get_output_value("name"), ["foo", "bar"])
+        loaded_item = il.load_item()
+        self.assertIsInstance(loaded_item, self.item_class)
+        self.assertEqual(
+            ItemAdapter(loaded_item).asdict(), dict({"name": ["foo", "bar"]})
+        )
+
+    def test_values_single(self):
+        """Values from initial item must be added to loader._values"""
+        input_item = self.item_class(name="foo")
+        il = ItemLoader(item=input_item)
+        self.assertEqual(il._values.get("name"), ["foo"])
+
+    def test_values_list(self):
+        """Values from initial item must be added to loader._values"""
+        input_item = self.item_class(name=["foo", "bar"])
+        il = ItemLoader(item=input_item)
+        self.assertEqual(il._values.get("name"), ["foo", "bar"])
+
+
+class InitializationFromDictTest(InitializationTestMixin, unittest.TestCase):
+    item_class = dict
+
+
+class InitializationFromItemTest(InitializationTestMixin, unittest.TestCase):
+    item_class = NameItem
+
+
+class InitializationFromAttrsItemTest(InitializationTestMixin, unittest.TestCase):
+    item_class = AttrsNameItem
+
+
+class InitializationFromDataClassTest(InitializationTestMixin, unittest.TestCase):
+    item_class = TestDataClass
+
+
+class BaseNoInputReprocessingLoader(ItemLoader):
+    title_in = MapCompose(str.upper)
+    title_out = TakeFirst()
+
+
+class NoInputReprocessingItem(Item):
+    title = Field()
+
+
+class NoInputReprocessingItemLoader(BaseNoInputReprocessingLoader):
+    default_item_class = NoInputReprocessingItem
+
+
+class NoInputReprocessingFromItemTest(unittest.TestCase):
     """
-    Tests recording migrations as applied or not.
+    Loaders initialized from loaded items must not reprocess fields (Item instances)
     """
 
-    databases = {"default", "other"}
-
-    def test_apply(self):
-        """
-        Tests marking migrations as applied/unapplied.
-        """
-        recorder = MigrationRecorder(connection)
+    def test_avoid_reprocessing_with_initial_values_single(self):
+        il = NoInputReprocessingItemLoader(item=NoInputReprocessingItem(title="foo"))
+        il_loaded = il.load_item()
+        self.assertEqual(il_loaded, {"title": "foo"})
         self.assertEqual(
-            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
-            set(),
-        )
-        recorder.record_applied("myapp", "0432_ponies")
-        self.assertEqual(
-            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
-            {("myapp", "0432_ponies")},
-        )
-        # That should not affect records of another database
-        recorder_other = MigrationRecorder(connections["other"])
-        self.assertEqual(
-            {(x, y) for (x, y) in recorder_other.applied_migrations() if x == "myapp"},
-            set(),
-        )
-        recorder.record_unapplied("myapp", "0432_ponies")
-        self.assertEqual(
-            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
-            set(),
+            NoInputReprocessingItemLoader(item=il_loaded).load_item(), {"title": "foo"}
         )
 
-
-class LoaderTests(TestCase):
-    """
-    Tests the disk and database loader, and running through migrations
-    in memory.
-    """
-
-    def setUp(self):
-        self.applied_records = []
-
-    def tearDown(self):
-        # Unapply records on databases that don't roll back changes after each
-        # test method.
-        if not connection.features.supports_transactions:
-            for recorder, app, name in self.applied_records:
-                recorder.record_unapplied(app, name)
-
-    def record_applied(self, recorder, app, name):
-        recorder.record_applied(app, name)
-        self.applied_records.append((recorder, app, name))
-
-    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
-    @modify_settings(INSTALLED_APPS={"append": "basic"})
-    def test_load(self):
-        """
-        Makes sure the loader can load the migrations for the test apps,
-        and then render them out to a new Apps.
-        """
-        # Load and test the plan
-        migration_loader = MigrationLoader(connection)
+    def test_avoid_reprocessing_with_initial_values_list(self):
+        il = NoInputReprocessingItemLoader(
+            item=NoInputReprocessingItem(title=["foo", "bar"])
+        )
+        il_loaded = il.load_item()
+        self.assertEqual(il_loaded, {"title": "foo"})
         self.assertEqual(
-            migration_loader.graph.forwards_plan(("migrations", "0002_second")),
+            NoInputReprocessingItemLoader(item=il_loaded).load_item(), {"title": "foo"}
+        )
+
+    def test_avoid_reprocessing_without_initial_values_single(self):
+        il = NoInputReprocessingItemLoader()
+        il.add_value("title", "FOO")
+        il_loaded = il.load_item()
+        self.assertEqual(il_loaded, {"title": "FOO"})
+        self.assertEqual(
+            NoInputReprocessingItemLoader(item=il_loaded).load_item(), {"title": "FOO"}
+        )
+
+    def test_avoid_reprocessing_without_initial_values_list(self):
+        il = NoInputReprocessingItemLoader()
+        il.add_value("title", ["foo", "bar"])
+        il_loaded = il.load_item()
+        self.assertEqual(il_loaded, {"title": "FOO"})
+        self.assertEqual(
+            NoInputReprocessingItemLoader(item=il_loaded).load_item(), {"title": "FOO"}
+        )
+
+
+class TestOutputProcessorItem(unittest.TestCase):
+    def test_output_processor(self):
+        class TempItem(Item):
+            temp = Field()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(self, *args, **kwargs)
+                self.setdefault("temp", 0.3)
+
+        class TempLoader(ItemLoader):
+            default_item_class = TempItem
+            default_input_processor = Identity()
+            default_output_processor = Compose(TakeFirst())
+
+        loader = TempLoader()
+        item = loader.load_item()
+        self.assertIsInstance(item, TempItem)
+        self.assertEqual(dict(item), {"temp": 0.3})
+
+
+class SelectortemLoaderTest(unittest.TestCase):
+    response = HtmlResponse(
+        url="",
+        encoding="utf-8",
+        body=b"""
+    <html>
+    <body>
+    <div id="id">marta</div>
+    <p>paragraph</p>
+    <a href="http://www.scrapy.org">homepage</a>
+    <img src="/images/logo.png" width="244" height="65" alt="Scrapy">
+    </body>
+    </html>
+    """,
+    )
+
+    def test_init_method(self):
+        l = TestItemLoader()
+        self.assertEqual(l.selector, None)
+
+    def test_init_method_errors(self):
+        l = TestItemLoader()
+        self.assertRaises(RuntimeError, l.add_xpath, "url", "//a/@href")
+        self.assertRaises(RuntimeError, l.replace_xpath, "url", "//a/@href")
+        self.assertRaises(RuntimeError, l.get_xpath, "//a/@href")
+        self.assertRaises(RuntimeError, l.add_css, "name", "#name::text")
+        self.assertRaises(RuntimeError, l.replace_css, "name", "#name::text")
+        self.assertRaises(RuntimeError, l.get_css, "#name::text")
+
+    def test_init_method_with_selector(self):
+        sel = Selector(text="<html><body><div>marta</div></body></html>")
+        l = TestItemLoader(selector=sel)
+        self.assertIs(l.selector, sel)
+
+        l.add_xpath("name", "//div/text()")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+
+    def test_init_method_with_selector_css(self):
+        sel = Selector(text="<html><body><div>marta</div></body></html>")
+        l = TestItemLoader(selector=sel)
+        self.assertIs(l.selector, sel)
+
+        l.add_css("name", "div::text")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+
+    def test_init_method_with_base_response(self):
+        """Selector should be None after initialization"""
+        response = Response("https://scrapy.org")
+        l = TestItemLoader(response=response)
+        self.assertIs(l.selector, None)
+
+    def test_init_method_with_response(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+
+        l.add_xpath("name", "//div/text()")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+
+    def test_init_method_with_response_css(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+
+        l.add_css("name", "div::text")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+
+        l.add_css("url", "a::attr(href)")
+        self.assertEqual(l.get_output_value("url"), ["http://www.scrapy.org"])
+
+        # combining/accumulating CSS selectors and XPath expressions
+        l.add_xpath("name", "//div/text()")
+        self.assertEqual(l.get_output_value("name"), ["Marta", "Marta"])
+
+        l.add_xpath("url", "//img/@src")
+        self.assertEqual(
+            l.get_output_value("url"), ["http://www.scrapy.org", "/images/logo.png"]
+        )
+
+    def test_add_xpath_re(self):
+        l = TestItemLoader(response=self.response)
+        l.add_xpath("name", "//div/text()", re="ma")
+        self.assertEqual(l.get_output_value("name"), ["Ma"])
+
+    def test_replace_xpath(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+        l.add_xpath("name", "//div/text()")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+        l.replace_xpath("name", "//p/text()")
+        self.assertEqual(l.get_output_value("name"), ["Paragraph"])
+
+        l.replace_xpath("name", ["//p/text()", "//div/text()"])
+        self.assertEqual(l.get_output_value("name"), ["Paragraph", "Marta"])
+
+    def test_get_xpath(self):
+        l = TestItemLoader(response=self.response)
+        self.assertEqual(l.get_xpath("//p/text()"), ["paragraph"])
+        self.assertEqual(l.get_xpath("//p/text()", TakeFirst()), "paragraph")
+        self.assertEqual(l.get_xpath("//p/text()", TakeFirst(), re="pa"), "pa")
+
+        self.assertEqual(
+            l.get_xpath(["//p/text()", "//div/text()"]), ["paragraph", "marta"]
+        )
+
+    def test_replace_xpath_multi_fields(self):
+        l = TestItemLoader(response=self.response)
+        l.add_xpath(None, "//div/text()", TakeFirst(), lambda x: {"name": x})
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+        l.replace_xpath(None, "//p/text()", TakeFirst(), lambda x: {"name": x})
+        self.assertEqual(l.get_output_value("name"), ["Paragraph"])
+
+    def test_replace_xpath_re(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+        l.add_xpath("name", "//div/text()")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+        l.replace_xpath("name", "//div/text()", re="ma")
+        self.assertEqual(l.get_output_value("name"), ["Ma"])
+
+    def test_add_css_re(self):
+        l = TestItemLoader(response=self.response)
+        l.add_css("name", "div::text", re="ma")
+        self.assertEqual(l.get_output_value("name"), ["Ma"])
+
+        l.add_css("url", "a::attr(href)", re="http://(.+)")
+        self.assertEqual(l.get_output_value("url"), ["www.scrapy.org"])
+
+    def test_replace_css(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+        l.add_css("name", "div::text")
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+        l.replace_css("name", "p::text")
+        self.assertEqual(l.get_output_value("name"), ["Paragraph"])
+
+        l.replace_css("name", ["p::text", "div::text"])
+        self.assertEqual(l.get_output_value("name"), ["Paragraph", "Marta"])
+
+        l.add_css("url", "a::attr(href)", re="http://(.+)")
+        self.assertEqual(l.get_output_value("url"), ["www.scrapy.org"])
+        l.replace_css("url", "img::attr(src)")
+        self.assertEqual(l.get_output_value("url"), ["/images/logo.png"])
+
+    def test_get_css(self):
+        l = TestItemLoader(response=self.response)
+        self.assertEqual(l.get_css("p::text"), ["paragraph"])
+        self.assertEqual(l.get_css("p::text", TakeFirst()), "paragraph")
+        self.assertEqual(l.get_css("p::text", TakeFirst(), re="pa"), "pa")
+
+        self.assertEqual(l.get_css(["p::text", "div::text"]), ["paragraph", "marta"])
+        self.assertEqual(
+            l.get_css(["a::attr(href)", "img::attr(src)"]),
+            ["http://www.scrapy.org", "/images/logo.png"],
+        )
+
+    def test_replace_css_multi_fields(self):
+        l = TestItemLoader(response=self.response)
+        l.add_css(None, "div::text", TakeFirst(), lambda x: {"name": x})
+        self.assertEqual(l.get_output_value("name"), ["Marta"])
+        l.replace_css(None, "p::text", TakeFirst(), lambda x: {"name": x})
+        self.assertEqual(l.get_output_value("name"), ["Paragraph"])
+
+        l.add_css(None, "a::attr(href)", TakeFirst(), lambda x: {"url": x})
+        self.assertEqual(l.get_output_value("url"), ["http://www.scrapy.org"])
+        l.replace_css(None, "img::attr(src)", TakeFirst(), lambda x: {"url": x})
+        self.assertEqual(l.get_output_value("url"), ["/images/logo.png"])
+
+    def test_replace_css_re(self):
+        l = TestItemLoader(response=self.response)
+        self.assertTrue(l.selector)
+        l.add_css("url", "a::attr(href)")
+        self.assertEqual(l.get_output_value("url"), ["http://www.scrapy.org"])
+        l.replace_css("url", "a::attr(href)", re=r"http://www\.(.+)")
+        self.assertEqual(l.get_output_value("url"), ["scrapy.org"])
+
+
+class SubselectorLoaderTest(unittest.TestCase):
+    response = HtmlResponse(
+        url="",
+        encoding="utf-8",
+        body=b"""
+    <html>
+    <body>
+    <header>
+      <div id="id">marta</div>
+      <p>paragraph</p>
+    </header>
+    <footer class="footer">
+      <a href="http://www.scrapy.org">homepage</a>
+      <img src="/images/logo.png" width="244" height="65" alt="Scrapy">
+    </footer>
+    </body>
+    </html>
+    """,
+    )
+
+    def test_nested_xpath(self):
+        l = NestedItemLoader(response=self.response)
+
+        nl = l.nested_xpath("//header")
+        nl.add_xpath("name", "div/text()")
+        nl.add_css("name_div", "#id")
+        nl.add_value("name_value", nl.selector.xpath('div[@id = "id"]/text()').getall())
+
+        self.assertEqual(l.get_output_value("name"), ["marta"])
+        self.assertEqual(l.get_output_value("name_div"), ['<div id="id">marta</div>'])
+        self.assertEqual(l.get_output_value("name_value"), ["marta"])
+
+        self.assertEqual(l.get_output_value("name"), nl.get_output_value("name"))
+        self.assertEqual(
+            l.get_output_value("name_div"), nl.get_output_value("name_div")
+        )
+        self.assertEqual(
+            l.get_output_value("name_value"), nl.get_output_value("name_value")
+        )
+
+    def test_nested_css(self):
+        l = NestedItemLoader(response=self.response)
+        nl = l.nested_css("header")
+        nl.add_xpath("name", "div/text()")
+        nl.add_css("name_div", "#id")
+        nl.add_value("name_value", nl.selector.xpath('div[@id = "id"]/text()').getall())
+
+        self.assertEqual(l.get_output_value("name"), ["marta"])
+        self.assertEqual(l.get_output_value("name_div"), ['<div id="id">marta</div>'])
+        self.assertEqual(l.get_output_value("name_value"), ["marta"])
+
+        self.assertEqual(l.get_output_value("name"), nl.get_output_value("name"))
+        self.assertEqual(
+            l.get_output_value("name_div"), nl.get_output_value("name_div")
+        )
+        self.assertEqual(
+            l.get_output_value("name_value"), nl.get_output_value("name_value")
+        )
+
+    def test_nested_replace(self):
+        l = NestedItemLoader(response=self.response)
+        nl1 = l.nested_xpath("//footer")
+        nl2 = nl1.nested_xpath("a")
+
+        l.add_xpath("url", "//footer/a/@href")
+        self.assertEqual(l.get_output_value("url"), ["http://www.scrapy.org"])
+        nl1.replace_xpath("url", "img/@src")
+        self.assertEqual(l.get_output_value("url"), ["/images/logo.png"])
+        nl2.replace_xpath("url", "@href")
+        self.assertEqual(l.get_output_value("url"), ["http://www.scrapy.org"])
+
+    def test_nested_ordering(self):
+        l = NestedItemLoader(response=self.response)
+        nl1 = l.nested_xpath("//footer")
+        nl2 = nl1.nested_xpath("a")
+
+        nl1.add_xpath("url", "img/@src")
+        l.add_xpath("url", "//footer/a/@href")
+        nl2.add_xpath("url", "text()")
+        l.add_xpath("url", "//footer/a/@href")
+
+        self.assertEqual(
+            l.get_output_value("url"),
             [
-                ("migrations", "0001_initial"),
-                ("migrations", "0002_second"),
+                "/images/logo.png",
+                "http://www.scrapy.org",
+                "homepage",
+                "http://www.scrapy.org",
             ],
         )
-        # Now render it out!
-        project_state = migration_loader.project_state(("migrations", "0002_second"))
-        self.assertEqual(len(project_state.models), 2)
 
-        author_state = project_state.models["migrations", "author"]
-        self.assertEqual(
-            list(author_state.fields), ["id", "name", "slug", "age", "rating"]
-        )
+    def test_nested_load_item(self):
+        l = NestedItemLoader(response=self.response)
+        nl1 = l.nested_xpath("//footer")
+        nl2 = nl1.nested_xpath("img")
 
-        book_state = project_state.models["migrations", "book"]
-        self.assertEqual(list(book_state.fields), ["id", "author"])
+        l.add_xpath("name", "//header/div/text()")
+        nl1.add_xpath("url", "a/@href")
+        nl2.add_xpath("image", "@src")
 
-        # Ensure we've included unmigrated apps in there too
-        self.assertIn("basic", project_state.real_apps)
+        item = l.load_item()
 
-    @override_settings(
-        MIGRATION_MODULES={
-            "migrations": "migrations.test_migrations",
-            "migrations2": "migrations2.test_migrations_2",
-        }
+        assert item is l.item
+        assert item is nl1.item
+        assert item is nl2.item
+
+        self.assertEqual(item["name"], ["marta"])
+        self.assertEqual(item["url"], ["http://www.scrapy.org"])
+        self.assertEqual(item["image"], ["/images/logo.png"])
+
+
+# Functions as processors
+
+
+def function_processor_strip(iterable):
+    return [x.strip() for x in iterable]
+
+
+def function_processor_upper(iterable):
+    return [x.upper() for x in iterable]
+
+
+class FunctionProcessorItem(Item):
+    foo = Field(
+        input_processor=function_processor_strip,
+        output_processor=function_processor_upper,
     )
-    @modify_settings(INSTALLED_APPS={"append": "migrations2"})
-    def test_plan_handles_repeated_migrations(self):
-        """
-        _generate_plan() doesn't readd migrations already in the plan (#29180).
-        """
-        migration_loader = MigrationLoader(connection)
-        nodes = [("migrations", "0002_second"), ("migrations2", "0001_initial")]
-        self.assertEqual(
-            migration_loader.graph._generate_plan(nodes, at_end=True),
-            [
-                ("migrations", "0001_initial"),
-                ("migrations", "0002_second"),
-                ("migrations2", "0001_initial"),
-            ],
-        )
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_unmigdep"}
-    )
-    def test_load_unmigrated_dependency(self):
-        """
-        The loader can load migrations with a dependency on an unmigrated app.
-        """
-        # Load and test the plan
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(
-            migration_loader.graph.forwards_plan(("migrations", "0001_initial")),
-            [
-                ("contenttypes", "0001_initial"),
-                ("auth", "0001_initial"),
-                ("migrations", "0001_initial"),
-            ],
-        )
-        # Now render it out!
-        project_state = migration_loader.project_state(("migrations", "0001_initial"))
-        self.assertEqual(
-            len([m for a, m in project_state.models if a == "migrations"]), 1
-        )
-
-        book_state = project_state.models["migrations", "book"]
-        self.assertEqual(list(book_state.fields), ["id", "user"])
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_run_before"}
-    )
-    def test_run_before(self):
-        """
-        Makes sure the loader uses Migration.run_before.
-        """
-        # Load and test the plan
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(
-            migration_loader.graph.forwards_plan(("migrations", "0002_second")),
-            [
-                ("migrations", "0001_initial"),
-                ("migrations", "0003_third"),
-                ("migrations", "0002_second"),
-            ],
-        )
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "migrations": "migrations.test_migrations_first",
-            "migrations2": "migrations2.test_migrations_2_first",
-        }
-    )
-    @modify_settings(INSTALLED_APPS={"append": "migrations2"})
-    def test_first(self):
-        """
-        Makes sure the '__first__' migrations build correctly.
-        """
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(
-            migration_loader.graph.forwards_plan(("migrations", "second")),
-            [
-                ("migrations", "thefirst"),
-                ("migrations2", "0001_initial"),
-                ("migrations2", "0002_second"),
-                ("migrations", "second"),
-            ],
-        )
-
-    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
-    def test_name_match(self):
-        "Tests prefix name matching"
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(
-            migration_loader.get_migration_by_prefix("migrations", "0001").name,
-            "0001_initial",
-        )
-        msg = "There is more than one migration for 'migrations' with the prefix '0'"
-        with self.assertRaisesMessage(AmbiguityError, msg):
-            migration_loader.get_migration_by_prefix("migrations", "0")
-        msg = "There is no migration for 'migrations' with the prefix 'blarg'"
-        with self.assertRaisesMessage(KeyError, msg):
-            migration_loader.get_migration_by_prefix("migrations", "blarg")
-
-    def test_load_import_error(self):
-        with override_settings(
-            MIGRATION_MODULES={"migrations": "import_error_package"}
-        ):
-            with self.assertRaises(ImportError):
-                MigrationLoader(connection)
-
-    def test_load_module_file(self):
-        with override_settings(
-            MIGRATION_MODULES={"migrations": "migrations.faulty_migrations.file"}
-        ):
-            loader = MigrationLoader(connection)
-            self.assertIn(
-                "migrations",
-                loader.unmigrated_apps,
-                "App with migrations module file not in unmigrated apps.",
-            )
-
-    def test_load_empty_dir(self):
-        with override_settings(
-            MIGRATION_MODULES={"migrations": "migrations.faulty_migrations.namespace"}
-        ):
-            loader = MigrationLoader(connection)
-            self.assertIn(
-                "migrations",
-                loader.unmigrated_apps,
-                "App missing __init__.py in migrations module not in unmigrated apps.",
-            )
-
-    @override_settings(
-        INSTALLED_APPS=["migrations.migrations_test_apps.migrated_app"],
-    )
-    def test_marked_as_migrated(self):
-        """
-        Undefined MIGRATION_MODULES implies default migration module.
-        """
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(migration_loader.migrated_apps, {"migrated_app"})
-        self.assertEqual(migration_loader.unmigrated_apps, set())
-
-    @override_settings(
-        INSTALLED_APPS=["migrations.migrations_test_apps.migrated_app"],
-        MIGRATION_MODULES={"migrated_app": None},
-    )
-    def test_marked_as_unmigrated(self):
-        """
-        MIGRATION_MODULES allows disabling of migrations for a particular app.
-        """
-        migration_loader = MigrationLoader(connection)
-        self.assertEqual(migration_loader.migrated_apps, set())
-        self.assertEqual(migration_loader.unmigrated_apps, {"migrated_app"})
-
-    @override_settings(
-        INSTALLED_APPS=["migrations.migrations_test_apps.migrated_app"],
-        MIGRATION_MODULES={"migrated_app": "missing-module"},
-    )
-    def test_explicit_missing_module(self):
-        """
-        If a MIGRATION_MODULES override points to a missing module, the error
-        raised during the importation attempt should be propagated unless
-        `ignore_no_migrations=True`.
-        """
-        with self.assertRaisesMessage(ImportError, "missing-module"):
-            migration_loader = MigrationLoader(connection)
-        migration_loader = MigrationLoader(connection, ignore_no_migrations=True)
-        self.assertEqual(migration_loader.migrated_apps, set())
-        self.assertEqual(migration_loader.unmigrated_apps, {"migrated_app"})
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed"}
-    )
-    def test_loading_squashed(self):
-        "Tests loading a squashed migration"
-        migration_loader = MigrationLoader(connection)
-        recorder = MigrationRecorder(connection)
-        self.addCleanup(recorder.flush)
-        # Loading with nothing applied should just give us the one node
-        self.assertEqual(
-            len([x for x in migration_loader.graph.nodes if x[0] == "migrations"]),
-            1,
-        )
-        # However, fake-apply one migration and it should now use the old two
-        self.record_applied(recorder, "migrations", "0001_initial")
-        migration_loader.build_graph()
-        self.assertEqual(
-            len([x for x in migration_loader.graph.nodes if x[0] == "migrations"]),
-            2,
-        )
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed_complex"}
-    )
-    def test_loading_squashed_complex(self):
-        "Tests loading a complex set of squashed migrations"
-
-        loader = MigrationLoader(connection)
-        recorder = MigrationRecorder(connection)
-        self.addCleanup(recorder.flush)
-
-        def num_nodes():
-            plan = set(loader.graph.forwards_plan(("migrations", "7_auto")))
-            return len(plan - loader.applied_migrations.keys())
-
-        # Empty database: use squashed migration
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 5)
-
-        # Starting at 1 or 2 should use the squashed migration too
-        self.record_applied(recorder, "migrations", "1_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 4)
-
-        self.record_applied(recorder, "migrations", "2_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 3)
-
-        # However, starting at 3 to 5 cannot use the squashed migration
-        self.record_applied(recorder, "migrations", "3_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 4)
-
-        self.record_applied(recorder, "migrations", "4_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 3)
-
-        # Starting at 5 to 7 we are past the squashed migrations.
-        self.record_applied(recorder, "migrations", "5_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 2)
-
-        self.record_applied(recorder, "migrations", "6_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 1)
-
-        self.record_applied(recorder, "migrations", "7_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 0)
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "app1": "migrations.test_migrations_squashed_complex_multi_apps.app1",
-            "app2": "migrations.test_migrations_squashed_complex_multi_apps.app2",
-        }
-    )
-    @modify_settings(
-        INSTALLED_APPS={
-            "append": [
-                "migrations.test_migrations_squashed_complex_multi_apps.app1",
-                "migrations.test_migrations_squashed_complex_multi_apps.app2",
-            ]
-        }
-    )
-    def test_loading_squashed_complex_multi_apps(self):
-        loader = MigrationLoader(connection)
-        loader.build_graph()
-
-        plan = set(loader.graph.forwards_plan(("app1", "4_auto")))
-        expected_plan = {
-            ("app1", "1_auto"),
-            ("app2", "1_squashed_2"),
-            ("app1", "2_squashed_3"),
-            ("app1", "4_auto"),
-        }
-        self.assertEqual(plan, expected_plan)
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "app1": "migrations.test_migrations_squashed_complex_multi_apps.app1",
-            "app2": "migrations.test_migrations_squashed_complex_multi_apps.app2",
-        }
-    )
-    @modify_settings(
-        INSTALLED_APPS={
-            "append": [
-                "migrations.test_migrations_squashed_complex_multi_apps.app1",
-                "migrations.test_migrations_squashed_complex_multi_apps.app2",
-            ]
-        }
-    )
-    def test_loading_squashed_complex_multi_apps_partially_applied(self):
-        loader = MigrationLoader(connection)
-        recorder = MigrationRecorder(connection)
-        self.record_applied(recorder, "app1", "1_auto")
-        self.record_applied(recorder, "app1", "2_auto")
-        loader.build_graph()
-
-        plan = set(loader.graph.forwards_plan(("app1", "4_auto")))
-        plan -= loader.applied_migrations.keys()
-        expected_plan = {
-            ("app2", "1_squashed_2"),
-            ("app1", "3_auto"),
-            ("app1", "4_auto"),
-        }
-
-        self.assertEqual(plan, expected_plan)
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "migrations": "migrations.test_migrations_squashed_erroneous"
-        }
-    )
-    def test_loading_squashed_erroneous(self):
-        "Tests loading a complex but erroneous set of squashed migrations"
-
-        loader = MigrationLoader(connection)
-        recorder = MigrationRecorder(connection)
-        self.addCleanup(recorder.flush)
-
-        def num_nodes():
-            plan = set(loader.graph.forwards_plan(("migrations", "7_auto")))
-            return len(plan - loader.applied_migrations.keys())
-
-        # Empty database: use squashed migration
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 5)
-
-        # Starting at 1 or 2 should use the squashed migration too
-        self.record_applied(recorder, "migrations", "1_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 4)
-
-        self.record_applied(recorder, "migrations", "2_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 3)
-
-        # However, starting at 3 or 4, nonexistent migrations would be needed.
-        msg = (
-            "Migration migrations.6_auto depends on nonexistent node "
-            "('migrations', '5_auto'). Django tried to replace migration "
-            "migrations.5_auto with any of [migrations.3_squashed_5] but wasn't able "
-            "to because some of the replaced migrations are already applied."
-        )
-
-        self.record_applied(recorder, "migrations", "3_auto")
-        with self.assertRaisesMessage(NodeNotFoundError, msg):
-            loader.build_graph()
-
-        self.record_applied(recorder, "migrations", "4_auto")
-        with self.assertRaisesMessage(NodeNotFoundError, msg):
-            loader.build_graph()
-
-        # Starting at 5 to 7 we are passed the squashed migrations
-        self.record_applied(recorder, "migrations", "5_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 2)
-
-        self.record_applied(recorder, "migrations", "6_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 1)
-
-        self.record_applied(recorder, "migrations", "7_auto")
-        loader.build_graph()
-        self.assertEqual(num_nodes(), 0)
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations"},
-        INSTALLED_APPS=["migrations"],
-    )
-    def test_check_consistent_history(self):
-        loader = MigrationLoader(connection=None)
-        loader.check_consistent_history(connection)
-        recorder = MigrationRecorder(connection)
-        self.record_applied(recorder, "migrations", "0002_second")
-        msg = (
-            "Migration migrations.0002_second is applied before its dependency "
-            "migrations.0001_initial on database 'default'."
-        )
-        with self.assertRaisesMessage(InconsistentMigrationHistory, msg):
-            loader.check_consistent_history(connection)
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed_extra"},
-        INSTALLED_APPS=["migrations"],
-    )
-    def test_check_consistent_history_squashed(self):
-        """
-        MigrationLoader.check_consistent_history() should ignore unapplied
-        squashed migrations that have all of their `replaces` applied.
-        """
-        loader = MigrationLoader(connection=None)
-        recorder = MigrationRecorder(connection)
-        self.record_applied(recorder, "migrations", "0001_initial")
-        self.record_applied(recorder, "migrations", "0002_second")
-        loader.check_consistent_history(connection)
-        self.record_applied(recorder, "migrations", "0003_third")
-        loader.check_consistent_history(connection)
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "app1": "migrations.test_migrations_squashed_ref_squashed.app1",
-            "app2": "migrations.test_migrations_squashed_ref_squashed.app2",
-        }
-    )
-    @modify_settings(
-        INSTALLED_APPS={
-            "append": [
-                "migrations.test_migrations_squashed_ref_squashed.app1",
-                "migrations.test_migrations_squashed_ref_squashed.app2",
-            ]
-        }
-    )
-    def test_loading_squashed_ref_squashed(self):
-        "Tests loading a squashed migration with a new migration referencing it"
-        r"""
-        The sample migrations are structured like this:
-
-        app_1       1 --> 2 ---------------------*--> 3        *--> 4
-                     \                          /             /
-                      *-------------------*----/--> 2_sq_3 --*
-                       \                 /    /
-        =============== \ ============= / == / ======================
-        app_2            *--> 1_sq_2 --*    /
-                          \                /
-                           *--> 1 --> 2 --*
-
-        Where 2_sq_3 is a replacing migration for 2 and 3 in app_1,
-        as 1_sq_2 is a replacing migration for 1 and 2 in app_2.
-        """
-
-        loader = MigrationLoader(connection)
-        recorder = MigrationRecorder(connection)
-        self.addCleanup(recorder.flush)
-
-        # Load with nothing applied: both migrations squashed.
-        loader.build_graph()
-        plan = set(loader.graph.forwards_plan(("app1", "4_auto")))
-        plan -= loader.applied_migrations.keys()
-        expected_plan = {
-            ("app1", "1_auto"),
-            ("app2", "1_squashed_2"),
-            ("app1", "2_squashed_3"),
-            ("app1", "4_auto"),
-        }
-        self.assertEqual(plan, expected_plan)
-
-        # Load with nothing applied and migrate to a replaced migration.
-        # Not possible if loader.replace_migrations is True (default).
-        loader.build_graph()
-        msg = "Node ('app1', '3_auto') not a valid node"
-        with self.assertRaisesMessage(NodeNotFoundError, msg):
-            loader.graph.forwards_plan(("app1", "3_auto"))
-        # Possible if loader.replace_migrations is False.
-        loader.replace_migrations = False
-        loader.build_graph()
-        plan = set(loader.graph.forwards_plan(("app1", "3_auto")))
-        plan -= loader.applied_migrations.keys()
-        expected_plan = {
-            ("app1", "1_auto"),
-            ("app2", "1_auto"),
-            ("app2", "2_auto"),
-            ("app1", "2_auto"),
-            ("app1", "3_auto"),
-        }
-        self.assertEqual(plan, expected_plan)
-        loader.replace_migrations = True
-
-        # Fake-apply a few from app1: unsquashes migration in app1.
-        self.record_applied(recorder, "app1", "1_auto")
-        self.record_applied(recorder, "app1", "2_auto")
-        loader.build_graph()
-        plan = set(loader.graph.forwards_plan(("app1", "4_auto")))
-        plan -= loader.applied_migrations.keys()
-        expected_plan = {
-            ("app2", "1_squashed_2"),
-            ("app1", "3_auto"),
-            ("app1", "4_auto"),
-        }
-        self.assertEqual(plan, expected_plan)
-
-        # Fake-apply one from app2: unsquashes migration in app2 too.
-        self.record_applied(recorder, "app2", "1_auto")
-        loader.build_graph()
-        plan = set(loader.graph.forwards_plan(("app1", "4_auto")))
-        plan -= loader.applied_migrations.keys()
-        expected_plan = {
-            ("app2", "2_auto"),
-            ("app1", "3_auto"),
-            ("app1", "4_auto"),
-        }
-        self.assertEqual(plan, expected_plan)
-
-    @override_settings(
-        MIGRATION_MODULES={"migrations": "migrations.test_migrations_private"}
-    )
-    def test_ignore_files(self):
-        """Files prefixed with underscore, tilde, or dot aren't loaded."""
-        loader = MigrationLoader(connection)
-        loader.load_disk()
-        migrations = [
-            name for app, name in loader.disk_migrations if app == "migrations"
-        ]
-        self.assertEqual(migrations, ["0001_initial"])
-
-    @override_settings(
-        MIGRATION_MODULES={
-            "migrations": "migrations.test_migrations_namespace_package"
-        },
-    )
-    def test_loading_namespace_package(self):
-        """Migration directories without an __init__.py file are ignored."""
-        loader = MigrationLoader(connection)
-        loader.load_disk()
-        migrations = [
-            name for app, name in loader.disk_migrations if app == "migrations"
-        ]
-        self.assertEqual(migrations, [])
-
-    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
-    def test_loading_package_without__file__(self):
-        """
-        To support frozen environments, MigrationLoader loads migrations from
-        regular packages with no __file__ attribute.
-        """
-        test_module = import_module("migrations.test_migrations")
-        loader = MigrationLoader(connection)
-        # __file__ == __spec__.origin or the latter is None and former is
-        # undefined.
-        module_file = test_module.__file__
-        module_origin = test_module.__spec__.origin
-        module_has_location = test_module.__spec__.has_location
-        try:
-            del test_module.__file__
-            test_module.__spec__.origin = None
-            test_module.__spec__.has_location = False
-            loader.load_disk()
-            migrations = [
-                name for app, name in loader.disk_migrations if app == "migrations"
-            ]
-            self.assertCountEqual(migrations, ["0001_initial", "0002_second"])
-        finally:
-            test_module.__file__ = module_file
-            test_module.__spec__.origin = module_origin
-            test_module.__spec__.has_location = module_has_location
 
 
-class PycLoaderTests(MigrationTestBase):
-    def test_valid(self):
-        """
-        To support frozen environments, MigrationLoader loads .pyc migrations.
-        """
-        with self.temporary_migration_module(
-            module="migrations.test_migrations"
-        ) as migration_dir:
-            # Compile .py files to .pyc files and delete .py files.
-            compileall.compile_dir(migration_dir, force=True, quiet=1, legacy=True)
-            for name in os.listdir(migration_dir):
-                if name.endswith(".py"):
-                    os.remove(os.path.join(migration_dir, name))
-            loader = MigrationLoader(connection)
-            self.assertIn(("migrations", "0001_initial"), loader.disk_migrations)
+class FunctionProcessorItemLoader(ItemLoader):
+    default_item_class = FunctionProcessorItem
 
-    def test_invalid(self):
-        """
-        MigrationLoader reraises ImportErrors caused by "bad magic number" pyc
-        files with a more helpful message.
-        """
-        with self.temporary_migration_module(
-            module="migrations.test_migrations_bad_pyc"
-        ) as migration_dir:
-            # The -tpl suffix is to avoid the pyc exclusion in MANIFEST.in.
-            os.rename(
-                os.path.join(migration_dir, "0001_initial.pyc-tpl"),
-                os.path.join(migration_dir, "0001_initial.pyc"),
-            )
-            msg = (
-                r"Couldn't import '\w+.migrations.0001_initial' as it appears "
-                "to be a stale .pyc file."
-            )
-            with self.assertRaisesRegex(ImportError, msg):
-                MigrationLoader(connection)
+
+class FunctionProcessorTestCase(unittest.TestCase):
+    def test_processor_defined_in_item(self):
+        lo = FunctionProcessorItemLoader()
+        lo.add_value("foo", "  bar  ")
+        lo.add_value("foo", ["  asdf  ", "  qwerty  "])
+        self.assertEqual(dict(lo.load_item()), {"foo": ["BAR", "ASDF", "QWERTY"]})
+
+
+if __name__ == "__main__":
+    unittest.main()
